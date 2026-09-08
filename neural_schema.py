@@ -1455,9 +1455,9 @@ class SystemAnalyzer:
 # ============================================================================
 
 def compute_layout(sg, algo="spring", seed=42):
+    import math
     if nx is None or sg.g is None:
         # trivial circular fallback
-        import math
         n = len(sg._nodes)
         return {nid: (math.cos(2*math.pi*i/max(n, 1)),
                       math.sin(2*math.pi*i/max(n, 1)))
@@ -1466,17 +1466,24 @@ def compute_layout(sg, algo="spring", seed=42):
     n = max(G.number_of_nodes(), 1)
     try:
         if algo == "kamada":
-            pos = nx.kamada_kawai_layout(G)
+            return nx.kamada_kawai_layout(G)
         elif algo == "shell":
-            pos = nx.shell_layout(G)
+            return nx.shell_layout(G)
         elif algo == "circular":
-            pos = nx.circular_layout(G)
+            return nx.circular_layout(G)
         else:
             k = 1.6 / (n ** 0.5)
-            pos = nx.spring_layout(G, k=k, iterations=120, seed=seed)
+            return nx.spring_layout(G, k=k, iterations=120, seed=seed)
     except Exception:
-        pos = nx.spring_layout(G, seed=seed)
-    return pos
+        pass
+
+    try:
+        return nx.circular_layout(G)
+    except Exception:
+        n = len(sg._nodes)
+        return {nid: (math.cos(2*math.pi*i/max(n, 1)),
+                      math.sin(2*math.pi*i/max(n, 1)))
+                for i, nid in enumerate(sg._nodes)}
 
 
 # ============================================================================
