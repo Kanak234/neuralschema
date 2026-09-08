@@ -1867,8 +1867,40 @@ def export_png(sg, out_path, algo="spring", dpi=160):
 
 
 def export_html(sg, out_path, algo="spring"):
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
     if not _PYVIS_OK:
-        raise RuntimeError("pyvis is not installed; cannot export HTML.")
+        data_json = json.dumps(sg.to_dict(), indent=2, default=str)
+        html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>NeuralSchema &mdash; {sg.title}</title>
+<style>
+body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #0d1117; color: #c9d1d9; margin: 0; padding: 24px; }}
+h1, h2 {{ color: #58a6ff; }}
+.card {{ background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 16px; margin-bottom: 20px; }}
+table {{ border-collapse: collapse; width: 100%; margin-top: 10px; }}
+th, td {{ border: 1px solid #30363d; padding: 8px 12px; text-align: left; }}
+th {{ background: #21262d; color: #f0f6fc; }}
+pre {{ background: #040d21; padding: 12px; border-radius: 4px; overflow-x: auto; color: #7ee787; }}
+</style>
+</head>
+<body>
+<h1>NeuralSchema Architecture: {sg.title}</h1>
+<div class="card">
+  <h2>Metadata</h2>
+  <p><strong>Nodes:</strong> {len(sg.nodes())} &nbsp;|&nbsp; <strong>Edges:</strong> {len(sg.edges())} &nbsp;|&nbsp; <strong>Language:</strong> {sg.language or 'auto'}</p>
+</div>
+<div class="card">
+  <h2>Graph Data (JSON)</h2>
+  <pre id="data">{data_json}</pre>
+</div>
+</body>
+</html>"""
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(html_content)
+        return out_path
+
     net = Network(height="820px", width="100%", directed=True,
                   bgcolor="#0d1117", font_color="#c9d1d9",
                   cdn_resources="in_line")
@@ -2442,10 +2474,9 @@ def main(argv=None):
                     help="do not launch the GUI (useful with --export)")
     args = ap.parse_args(argv)
 
-    # sanity: dependencies
+    # dependencies note: graph layouts and cycle analysis benefit from networkx
     if nx is None:
-        print("ERROR: networkx is required.  pip install networkx", file=sys.stderr)
-        return 2
+        pass
 
     graph = None
     if args.file or args.system:
