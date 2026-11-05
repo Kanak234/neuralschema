@@ -213,7 +213,8 @@ class TestPE(unittest.TestCase):
         self.assertEqual(i["format"], "PE")
         self.assertEqual(i["arch"], "x86-64")
         self.assertIn("KERNEL32.dll", i["libraries"])
-        self.assertIn("CreateProcessA", {x["name"] for x in i["imports"]})
+        # setuptools' launcher uses CreateProcessA, pip's uses CreateProcessW
+        self.assertTrue({"CreateProcessA", "CreateProcessW"} & {x["name"] for x in i["imports"]})
         self.assertRegex(i["extra"]["imphash"], r"^[0-9a-f]{32}$")
         self.assertTrue(i["mitigations"]["DEP / NX"])
         self.assertNotIn("_iat", i)
@@ -223,7 +224,7 @@ class TestPE(unittest.TestCase):
         i = analyze_binary_info(PE)
         self.assertTrue(any(n.startswith("sub_") for n in i["disasm"]))
         called = {c for f in i["disasm"].values() for c in f["calls"]}
-        self.assertIn("CreateProcessA", called)
+        self.assertTrue({"CreateProcessA", "CreateProcessW"} & called)
 
 
 class TestSyntheticFormats(unittest.TestCase):
