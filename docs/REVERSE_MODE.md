@@ -35,6 +35,10 @@ claude mcp add neuralschema -- python3 /full/path/neural_schema.py --mcp
 | `.apk` `.jar` `.aar` `.ipa` `.whl` `.zip` / Office files | Package type, manifest facts, folders, DEX files. Embedded native libraries are analysed too. |
 | `.wasm` | Sections, host imports (`env.log`...), exports, function count |
 | `.gguf` / `.safetensors` | Architecture, metadata, every tensor's shape and dtype, total parameter count |
+| HTML pages (0.4.1) | Title, inline/external scripts, data blocks, links, forms (password forms and where they post), iframes, CSP meta, inline event handlers, external domains. The JS functions and their call graph come from inline scripts. |
+| JavaScript / TypeScript | Functions and who calls whom, `import`/`require` modules, classes, minified-bundle detection |
+| JSON | `package.json` dependencies and install scripts, browser-extension permissions, otherwise the top-level keys |
+| Scripts, config and plain text | Content preview, plus web/script capability rules (eval, innerHTML, cookies, fetch, WebSocket, clipboard, camera, obfuscation, `child_process`, PowerShell download…) |
 | Anything else | Entropy plus interesting strings |
 | Source code | The existing code analyzers (unchanged) |
 

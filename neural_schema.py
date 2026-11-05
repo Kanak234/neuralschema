@@ -2843,7 +2843,7 @@ CAPABILITY_RULES = [
 
 def _detect_capabilities(info):
     names = {i["name"].lower() for i in info["imports"]}
-    caps = []
+    caps = list(info.get("capabilities") or [])     # keep parser-found hints
     for cap, sev, rule in CAPABILITY_RULES:
         ev = sorted(names & rule)
         if ev:
@@ -2988,6 +2988,413 @@ def _objdump_functions(path, info, max_lines=400, timeout=90,
             info["functions"].append({"name": k, "addr": v["addr"], "size": 0})
 
 
+# --------------------------------------------------- text / web files -------
+#
+#  WHY: a lot of what people want to reverse is NOT machine code -- web pages,
+#  bundled/minified JavaScript, browser-extension manifests, package.json,
+#  config files.  Before 0.4.1 these fell through to "Unknown format".  This
+#  part reads them as TEXT and pulls out the same kind of evidence:
+#     HTML  -> scripts (inline / external), links, forms, iframes, meta/CSP,
+#              inline event handlers, external domains; inline JS is analysed
+#     JS    -> functions + a call graph between them, imports/requires,
+#              risky browser APIs (eval, innerHTML, cookies, fetch, WebSocket...)
+#     JSON  -> package.json dependencies + scripts, browser-extension
+#              permissions, otherwise the top-level structure
+#     other -> a preview of the first lines
+#  Everything lands in the same `info` dict, so graph, animation, AI pack and
+#  MCP tools work unchanged.  Regex-based on purpose (no JS parser
+#  dependency): good enough for triage, and it never executes anything.
+# ----------------------------------------------------------------------------
+
+from html.parser import HTMLParser as _HTMLParser   # stdlib, for HTML pages
+from urllib.parse import urlparse                       # external-domain checks
+
+_TEXT_EXT = {
+    ".html": "HTML document", ".htm": "HTML document", ".xhtml": "HTML document",
+    ".js": "JavaScript", ".mjs": "JavaScript", ".cjs": "JavaScript", ".jsx": "JavaScript",
+    ".ts": "TypeScript", ".tsx": "TypeScript", ".json": "JSON", ".css": "CSS",
+    ".xml": "XML", ".svg": "SVG image (XML)", ".md": "Markdown", ".txt": "Text",
+    ".yml": "YAML", ".yaml": "YAML", ".toml": "TOML", ".ini": "INI config",
+    ".cfg": "Config", ".conf": "Config", ".ps1": "PowerShell script",
+    ".bat": "Batch script", ".cmd": "Batch script", ".vbs": "VBScript",
+    ".php": "PHP", ".rb": "Ruby", ".go": "Go source", ".rs": "Rust source",
+    ".kt": "Kotlin source", ".swift": "Swift source", ".sql": "SQL",
+}
+
+# Browser / script APIs -> capability hint (name, severity, regex)
+_WEB_RULES = [
+    ("runs dynamic code (eval / new Function)", "high",
+     r"\beval\s*\(|\bnew\s+Function\s*\(|set(?:Timeout|Interval)\s*\(\s*['\"]"),
+    ("HTML injection sinks (innerHTML / document.write)", "medium",
+     r"\.(?:inner|outer)HTML\s*=|\binsertAdjacentHTML\s*\(|\bdocument\.write(?:ln)?\s*\("),
+    ("reads or writes cookies", "medium", r"\bdocument\.cookie\b"),
+    ("network requests", "low", r"\bfetch\s*\(|\bXMLHttpRequest\b|\baxios\.|\$\.ajax\b|\bsendBeacon\s*\("),
+    ("WebSocket connection", "low", r"\bnew\s+WebSocket\s*\("),
+    ("browser storage", "low", r"\b(?:local|session)Storage\b|\bindexedDB\b"),
+    ("clipboard access", "medium", r"\bnavigator\.clipboard\b|execCommand\s*\(\s*['\"]copy"),
+    ("camera / microphone / screen", "medium", r"\bgetUserMedia\b|\bgetDisplayMedia\b"),
+    ("geolocation", "medium", r"\bnavigator\.geolocation\b"),
+    ("obfuscation hints", "medium", r"\batob\s*\(|String\.fromCharCode\s*\(|\bunescape\s*\(|\\x[0-9a-f]{2}\\x[0-9a-f]{2}\\x[0-9a-f]{2}"),
+    ("cross-window messaging", "low", r"\bpostMessage\s*\(|addEventListener\s*\(\s*['\"]message"),
+    ("crypto in the browser", "low", r"\bcrypto\.subtle\b|\bCryptoJS\b"),
+    ("keystroke capture", "medium", r"addEventListener\s*\(\s*['\"]key(?:down|press|up)['\"]|\bonkey(?:down|press|up)\s*="),
+    ("runs other programs", "medium", r"\bchild_process\b|\bexecSync\s*\(|\bspawn\s*\(|Start-Process|Invoke-Expression|\bIEX\b|WScript\.Shell"),
+    ("downloads from the internet", "medium", r"Invoke-WebRequest|DownloadString|DownloadFile|\bcurl\s+-|\bwget\s+"),
+]
+
+def _js_regexes():
+    import re
+    return {
+        "func": re.compile(
+            r"(?:^|[^\w$.])(?:async\s+)?function\s*\*?\s*([A-Za-z_$][\w$]*)\s*\("
+            r"|(?:^|[^\w$.])(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?"
+            r"(?:function\b[^(]*\(|\([^()]*\)\s*=>|[A-Za-z_$][\w$]*\s*=>)"
+            r"|^\s*(?:async\s+)?(?!if\b|for\b|while\b|switch\b|catch\b|return\b|function\b)"
+            r"([A-Za-z_$][\w$]*)\s*\([^()]*\)\s*\{", re.M),
+        "cls": re.compile(r"\bclass\s+([A-Za-z_$][\w$]*)"),
+        "imp": re.compile(r"\bimport\s+(?:[^'\";]+?\s+from\s+)?['\"]([^'\"]+)['\"]"
+                          r"|\brequire\s*\(\s*['\"]([^'\"]+)['\"]\s*\)"
+                          r"|\bimport\s*\(\s*['\"]([^'\"]+)['\"]\s*\)"),
+        "call": re.compile(r"(?<![\w$.])([A-Za-z_$][\w$]*)\s*\("),
+    }
+
+
+def _brace_body(text, start, limit=200_000):
+    """Index just past the '}' matching the first '{' at/after start (rough:
+    skips braces inside simple quotes/template strings)."""
+    i = text.find("{", start, start + 2000)
+    if i < 0:
+        return None
+    depth, q, n = 0, None, min(len(text), i + limit)
+    while i < n:
+        c = text[i]
+        if q:
+            if c == "\\":
+                i += 2
+                continue
+            if c == q:
+                q = None
+        elif c in "'\"`":
+            q = c
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        i += 1
+    return None
+
+
+def _analyze_js(code, info, section=None, label="script", line_offset=0):
+    """Functions, call graph, imports and capability evidence from JS/TS."""
+    R = _js_regexes()
+    keywords = {"if", "for", "while", "switch", "catch", "return", "function", "typeof",
+                "new", "await", "super", "import", "require", "constructor"}
+    found = []
+    for m in R["func"].finditer(code):
+        name = m.group(1) or m.group(2) or m.group(3)
+        if name and name not in keywords:
+            found.append((name, m.start()))
+    for name, pos in found[:3000]:
+        end = _brace_body(code, pos)
+        body = code[pos:end] if end else code[pos:pos + 400]
+        line = code.count("\n", 0, pos) + 1 + line_offset
+        info["functions"].append({"name": name, "addr": f"line {line}", "size": len(body),
+                                  "section": section})
+        lines = body.splitlines()
+        info["disasm"].setdefault(name, {"addr": f"line {line}", "calls": [],
+                                         "lines": lines[:400], "count": len(lines),
+                                         "_body": body})
+    names = {n for n, _ in found}
+    for name, f in info["disasm"].items():
+        body = f.pop("_body", None)
+        if body is None:
+            continue
+        for c in R["call"].findall(body[body.find("{") + 1:] if "{" in body else body):
+            if c in names and c != name and c not in f["calls"]:
+                f["calls"].append(c)
+    for m in R["imp"].finditer(code):
+        mod = m.group(1) or m.group(2) or m.group(3)
+        if mod not in info["libraries"]:
+            info["libraries"].append(mod)
+        info["imports"].append({"lib": mod, "name": mod.rsplit("/", 1)[-1]})
+    classes = R["cls"].findall(code)
+    if classes:
+        info["extra"].setdefault("classes", []).extend(classes[:200])
+    lines = code.splitlines() or [""]
+    if len(code) > 5000 and len(code) / len(lines) > 400:
+        info["notes"].append(f"{label}: minified / bundled code (very long lines) — "
+                             "pretty-print it (e.g. prettier) before reading.")
+
+
+def _web_capabilities(text, info):
+    """Regex rules over the whole text -> capability hints with evidence."""
+    import re
+    for cap, sev, rx in _WEB_RULES:
+        hits = []
+        for m in re.finditer(rx, text, re.I):
+            hits.append(m.group(0).strip()[:40])
+            if len(hits) >= 6:
+                break
+        if hits:
+            info["capabilities"].append({"name": cap, "severity": sev,
+                                         "evidence": sorted(set(hits))})
+
+
+class _HtmlScan(_HTMLParser):
+    """Collects the security-relevant structure of an HTML page."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.title, self._in = [], None
+        self.scripts, self.styles, self.links = [], [], []
+        self.forms, self.iframes, self.meta, self.handlers = [], [], [], []
+        self._buf = []
+
+    def handle_starttag(self, tag, attrs):
+        a = {k.lower(): (v or "") for k, v in attrs}
+        for k, v in a.items():
+            if k.startswith("on") and v:
+                self.handlers.append(f"<{tag} {k}>")
+        if tag == "script":
+            stype = a.get("type", "").lower()
+            if a.get("src"):
+                self.scripts.append({"src": a["src"], "code": None, "line": self.getpos()[0],
+                                     "type": stype})
+            else:
+                self._in, self._buf = "script", []
+                self._line, self._stype = self.getpos()[0], stype
+        elif tag == "style":
+            self._in, self._buf = "style", []
+        elif tag == "title":
+            self._in, self._buf = "title", []
+        elif tag == "link" and a.get("href"):
+            self.styles.append(a["href"])
+        elif tag == "a" and a.get("href"):
+            self.links.append(a["href"])
+        elif tag == "form":
+            self.forms.append({"action": a.get("action", ""), "method": a.get("method", "get").lower(),
+                               "password": False})
+        elif tag == "input" and a.get("type", "").lower() == "password" and self.forms:
+            self.forms[-1]["password"] = True
+        elif tag == "iframe":
+            self.iframes.append(a.get("src", "(srcdoc)" if "srcdoc" in a else ""))
+        elif tag == "meta":
+            if a.get("http-equiv", "").lower() == "content-security-policy":
+                self.meta.append("CSP: " + a.get("content", "")[:200])
+            elif a.get("name", "").lower() in ("description", "generator", "robots"):
+                self.meta.append(f"{a['name']}: {a.get('content', '')[:120]}")
+
+    def handle_endtag(self, tag):
+        if tag == self._in:
+            text = "".join(self._buf)
+            if tag == "script":
+                self.scripts.append({"src": None, "code": text, "line": self._line,
+                                     "type": self._stype})
+            elif tag == "title":
+                self.title.append(text.strip())
+            self._in = None
+
+    def handle_data(self, data):
+        if self._in:
+            self._buf.append(data)
+
+
+def _looks_text(data):
+    """UTF-8 (or UTF-16 with BOM) and almost no control bytes -> text."""
+    head = data[:65536]
+    if not head:
+        return False
+    if head[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        return True
+    if b"\x00" in head:
+        return False
+    try:
+        head.decode("utf-8")
+    except UnicodeDecodeError as e:
+        if e.start < len(head) - 4:          # a cut multi-byte char at the end is fine
+            return False
+    ctrl = sum(1 for b in head if b < 9 or 13 < b < 32)
+    return ctrl / len(head) < 0.01
+
+
+def _parse_text(data, info):
+    """HTML / JS / JSON / config / script files."""
+    import re
+    if data[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        text = data.decode("utf-16", "replace")
+    else:
+        text = data.decode("utf-8", "replace").lstrip("﻿")
+    name = info["name"].lower()
+    ext = os.path.splitext(name)[1]
+    head = text[:2000].lstrip().lower()
+    kind = _TEXT_EXT.get(ext)
+    if kind is None:
+        if head.startswith(("<!doctype html", "<html")) or "<body" in head:
+            kind = "HTML document"
+        elif head.startswith(("{", "[")):
+            kind = "JSON"
+        elif head.startswith("<?xml"):
+            kind = "XML"
+        elif head.startswith("#!"):
+            kind = "Script (" + head[2:].split("\n", 1)[0].strip()[:40] + ")"
+        else:
+            kind = "Text"
+    lines = text.splitlines()
+    info.update(format=kind, type="text", encoding="utf-8")
+    info["extra"].update(lines=len(lines), characters=len(text))
+    info["extra"]["preview"] = [ln[:300] for ln in lines[:40]]
+    info["code_lang"] = {"HTML document": "html", "JavaScript": "js", "TypeScript": "ts",
+                         "JSON": "json", "CSS": "css"}.get(kind, "text")
+
+    if kind == "HTML document":
+        p = _HtmlScan()
+        try:
+            p.feed(text)
+        except Exception as e:                # broken markup: keep what we have
+            info["notes"].append(f"HTML parser stopped: {e}")
+        if p.title:
+            info["extra"]["title"] = p.title[0][:200]
+        domains = set()
+        for k, s in enumerate(p.scripts):
+            if s["src"]:
+                info["sections"].append({"name": f"script src={s['src'][:80]}", "addr": "",
+                                         "offset": 0, "size": 0, "flags": "ext", "entropy": 0.0})
+                info["libraries"].append(s["src"][:200])
+                host = urlparse(s["src"]).netloc
+                if host:
+                    domains.add(host)
+            elif s["type"] and "javascript" not in s["type"] and s["type"] != "module" \
+                    and "ecmascript" not in s["type"]:
+                # <script type="application/json"> etc. is DATA, not code
+                code = s["code"] or ""
+                info["sections"].append({"name": f"data block #{k + 1} ({s['type']}, line {s['line']})",
+                                         "addr": "", "offset": 0, "size": len(code), "flags": "data",
+                                         "entropy": shannon_entropy(code.encode()[:200000])})
+            else:
+                code = s["code"] or ""
+                idx = len(info["sections"])
+                info["sections"].append({"name": f"inline script #{k + 1} (line {s['line']})",
+                                         "addr": "", "offset": 0, "size": len(code),
+                                         "flags": "js", "entropy": shannon_entropy(code.encode()[:200000])})
+                _analyze_js(code, info, section=idx, label=f"inline script #{k + 1}",
+                            line_offset=s["line"] - 1)
+        for href in p.styles + p.links + p.iframes:
+            host = urlparse(href).netloc
+            if host:
+                domains.add(host)
+        info["extra"].update(links=len(p.links), stylesheets=p.styles[:30],
+                             iframes=p.iframes[:30], forms=p.forms[:30], meta=p.meta[:20],
+                             inline_event_handlers=len(p.handlers),
+                             external_domains=sorted(domains)[:60])
+        for f in p.forms:
+            act_host = urlparse(f["action"]).netloc
+            if f["password"]:
+                info["capabilities"].append({
+                    "name": "password form" + (f" posting to {act_host}" if act_host else ""),
+                    "severity": "high" if act_host else "medium",
+                    "evidence": [f"{f['method'].upper()} {f['action'] or '(same page)'}"]})
+        if p.iframes:
+            info["capabilities"].append({"name": "embeds other pages (iframes)", "severity": "low",
+                                         "evidence": p.iframes[:6]})
+        if p.handlers:
+            info["capabilities"].append({"name": "inline event handlers", "severity": "low",
+                                         "evidence": sorted(set(p.handlers))[:6]})
+        if not any(m.startswith("CSP") for m in p.meta) and any(not s["src"] for s in p.scripts):
+            info["notes"].append("Inline scripts and no Content-Security-Policy meta tag "
+                                 "(a CSP may still be sent as an HTTP header).")
+    elif kind in ("JavaScript", "TypeScript"):
+        info["sections"].append({"name": "script", "addr": "", "offset": 0, "size": len(text),
+                                 "flags": "js", "entropy": info["entropy"]})
+        _analyze_js(text, info, section=0, label=info["name"])
+    elif kind == "JSON":
+        try:
+            j = json.loads(text)
+        except ValueError as e:
+            info["notes"].append(f"Invalid JSON: {e}")
+            j = None
+        if isinstance(j, dict):
+            info["extra"]["top_level_keys"] = list(j)[:60]
+            deps = {}
+            for k in ("dependencies", "devDependencies", "peerDependencies", "optionalDependencies"):
+                if isinstance(j.get(k), dict):
+                    deps.update(j[k])
+            if deps:                                   # package.json
+                info["format"] = "npm package.json"
+                info["libraries"] = [f"{d}@{v}" for d, v in list(deps.items())[:400]]
+                info["imports"] = [{"lib": f"{d}@{v}", "name": d} for d, v in list(deps.items())[:400]]
+                scripts = j.get("scripts") or {}
+                info["extra"]["scripts"] = scripts
+                risky = [f"{k}: {v}"[:80] for k, v in scripts.items()
+                         if k in ("preinstall", "install", "postinstall", "prepare")]
+                if risky:
+                    info["capabilities"].append({"name": "runs code at npm install time",
+                                                 "severity": "medium", "evidence": risky})
+            if "manifest_version" in j:                # browser extension
+                info["format"] = f"Browser extension manifest (MV{j.get('manifest_version')})"
+                perms = [str(x) for x in (j.get("permissions") or []) + (j.get("host_permissions") or [])]
+                info["extra"]["permissions"] = perms
+                hi = {"<all_urls>", "tabs", "cookies", "webRequest", "webRequestBlocking",
+                      "debugger", "nativeMessaging", "history", "clipboardRead", "scripting",
+                      "declarativeNetRequest", "management", "proxy", "downloads"}
+                hot = [x for x in perms if x in hi or x.startswith(("*://", "http"))]
+                if hot:
+                    info["capabilities"].append({"name": "powerful extension permissions",
+                                                 "severity": "high" if "<all_urls>" in perms or
+                                                 "debugger" in perms else "medium",
+                                                 "evidence": hot[:12]})
+        elif isinstance(j, list):
+            info["extra"]["array_length"] = len(j)
+    elif kind == "CSS":
+        imps = re.findall(r"@import\s+(?:url\()?['\"]?([^'\")\s;]+)", text)
+        info["libraries"] = imps[:60]
+        info["extra"]["rules"] = text.count("{")
+    else:
+        # generic text: still worth scanning for script-like behaviour
+        pass
+    _web_capabilities(text, info)
+
+
+def _ai_questions(info):
+    """Questions that fit the KIND of file (a web page has no `main`)."""
+    t, f = info.get("type"), info.get("format", "")
+    if t == "text":
+        if "manifest" in f.lower():
+            return ["What does this browser extension do, and does it really need each permission?",
+                    "Which permissions could be abused (data theft, tracking, injection)?",
+                    "What should I check in its background/content scripts next?"]
+        if "package.json" in f:
+            return ["What kind of project is this and what are its main dependencies for?",
+                    "Do any install scripts or dependencies look risky or typo-squatted?",
+                    "Which dependencies are outdated or unnecessary?"]
+        return ["In plain words, what does this file do? Name the evidence (functions, "
+                "imports, APIs, strings) for each claim.",
+                "Explain the main functions and how they call each other (use the call graph).",
+                "Which capability hints are real risks (XSS sinks, eval, cookie/credential "
+                "handling, data sent to other domains) and which are normal?",
+                "Is anything obfuscated, tracking the user or sending data somewhere unexpected?",
+                "Suggest concrete security and code-quality fixes, most important first."]
+    if t == "archive":
+        return ["What is this package/app and what does it contain?",
+                "Which embedded binaries or permissions deserve a closer look, and why?",
+                "Is anything suspicious? Rate your confidence.",
+                "What should I unpack or decompile next, and with which tool (JADX, REA, Ghidra)?"]
+    if info["extra"].get("tensors"):
+        return ["Which model architecture and size is this (layers, heads, context, quantization)?",
+                "How much memory would it need to run, and on what hardware?",
+                "Is anything unusual in the metadata or tensor list?"]
+    return ["In plain words, what does this program do? Name the evidence "
+            "(imports, strings, functions) for each claim.",
+            "Walk through `main` / the entry point step by step.",
+            "Which capability hints are real and which are normal library usage?",
+            "Is anything suspicious (persistence, injection, data theft, "
+            "hidden network contact)? Rate your confidence.",
+            "Rewrite the most important function as readable C or Python pseudocode.",
+            "What would you inspect next, and with which tool (Ghidra, REA, "
+            "a debugger in a sandbox)?"]
+
+
 # ------------------------------------------------------------- driver -------
 def _analyze_bytes(data, name, depth=0, disasm_path=None, disasm=True):
     """Bytes -> info dict.  Never raises for a bad file: the error is recorded
@@ -3006,6 +3413,8 @@ def _analyze_bytes(data, name, depth=0, disasm_path=None, disasm=True):
             info.update(format="Java class", type="bytecode")
             info["notes"].append("Single Java class: use a Java decompiler "
                                  "(CFR / Fernflower / JADX).")
+        elif _looks_text(data):
+            _parse_text(data, info)          # HTML / JS / JSON / scripts / config
         else:
             info["notes"].append("Unknown format: showing strings and entropy only.")
     except Exception as e:      # noqa: BLE001 -- hostile input must never crash us
@@ -3066,13 +3475,14 @@ def _info_to_graph(info, sg=None, prefix="", max_imports=700, max_funcs=900,
     cut = {}
 
     # sections (and an address -> section lookup for functions)
-    sec_ranges = []
+    sec_ranges, sec_ids = [], {}
     for i, s in enumerate(info["sections"][:200]):
         sid = sg.add_node(f"{P}sec:{i}:{s['name']}", K_SECTION, s["name"] or "?",
                           size=s["size"], flags=s.get("flags"),
                           entropy=s.get("entropy"), addr=s.get("addr"),
                           **({"high_entropy": True} if s.get("entropy", 0) >= 7.2 else {}))
         sg.add_edge(root, sid, R_CONTAINS)
+        sec_ids[i] = sid
         try:
             a = int(s.get("addr") or "0", 16)
             if a and s["size"]:
@@ -3121,7 +3531,8 @@ def _info_to_graph(info, sg=None, prefix="", max_imports=700, max_funcs=900,
                           addr=f["addr"], size=f.get("size"),
                           instructions=dis.get(f["name"], {}).get("count"),
                           exported=f["name"] in exports)
-        sg.add_edge(home(f["addr"]), nid, R_CONTAINS)
+        parent = sec_ids.get(f["section"]) if f.get("section") is not None else None
+        sg.add_edge(parent or home(f["addr"]), nid, R_CONTAINS)
         fn_ids[f["name"]] = nid
     for name in info["exports"][:max_funcs]:
         if name in fn_ids:
@@ -3218,7 +3629,7 @@ def ai_pack_markdown(info, max_functions=25, max_lines=60):
         if info.get(k) not in (None, ""):
             L.append(f"| {k} | `{esc(info[k])}` |")
     for k, v in info["extra"].items():
-        if k in ("tensors", "files", "metadata"):
+        if k in ("tensors", "files", "metadata", "preview"):
             continue
         L.append(f"| {esc(k)} | `{esc(v)[:200]}` |")
     if info["mitigations"]:
@@ -3259,13 +3670,18 @@ def ai_pack_markdown(info, max_functions=25, max_lines=60):
         for name, f in ranked[:120]:
             if f["calls"]:
                 L.append(f"- `{esc(name)}` → " + ", ".join(f"`{esc(c)}`" for c in f["calls"][:20]))
-        L += ["", f"## Disassembly excerpts (top {min(max_functions, len(ranked))} functions)", ""]
+        is_src = info.get("type") == "text"
+        lang = info.get("code_lang", "text") if is_src else "asm"
+        unit = "lines" if is_src else "instructions"
+        L += ["", f"## {'Source' if is_src else 'Disassembly'} excerpts "
+                  f"(top {min(max_functions, len(ranked))} functions)", ""]
         prio = sorted(dis.items(), key=lambda kv: (kv[0] not in ("main", "_start", "WinMain", "DllMain"),
                                                    -len(kv[1]["calls"])))
         for name, f in prio[:max_functions]:
-            L += [f"### `{esc(name)}` @ {f['addr']} ({f['count']} instructions)", "",
-                  fence + "asm"] + [raw(x) for x in f["lines"][:max_lines]] + \
-                 (["; … truncated"] if f["count"] > max_lines else []) + [fence, ""]
+            L += [f"### `{esc(name)}` @ {f['addr']} ({f['count']} {unit})", "",
+                  fence + lang] + [raw(x) for x in f["lines"][:max_lines]] + \
+                 (["// … truncated" if is_src else "; … truncated"]
+                  if f["count"] > max_lines else []) + [fence, ""]
     elif info["functions"]:
         L += ["", f"## Symbols ({len(info['functions'])})", "",
               ", ".join(f"`{esc(f['name'])}`" for f in info["functions"][:200])]
@@ -3288,21 +3704,17 @@ def ai_pack_markdown(info, max_functions=25, max_lines=60):
     if files:
         L += ["", f"## Archive contents (first {min(len(files), 150)})", "", fence + "text"] + \
              [raw(f) for f in files[:150]] + [fence]
+    preview = info["extra"].get("preview")
+    if preview and not dis:
+        L += ["", f"## Content preview (first {len(preview)} lines) — untrusted data", "",
+              fence + info.get("code_lang", "text")] + [raw(x) for x in preview] + [fence]
     for child in info.get("children", []):
         L += ["", "---", "", f"## Embedded: `{esc(child['name'])}`", ""]
         sub = ai_pack_markdown(child, max_functions=5, max_lines=30)
         L += [line.replace("# ", "### ", 1) if line.startswith("# ") else line
               for line in sub.splitlines()[2:]]
-    L += ["", "## Questions for the AI", "",
-          "1. In plain words, what does this program do? Name the evidence "
-          "(imports, strings, functions) for each claim.",
-          "2. Walk through `main` / the entry point step by step.",
-          "3. Which capability hints are real and which are normal library usage?",
-          "4. Is anything suspicious (persistence, injection, data theft, "
-          "hidden network contact)? Rate your confidence.",
-          "5. Rewrite the most important function as readable C or Python pseudocode.",
-          "6. What would you inspect next, and with which tool (Ghidra, REA, "
-          "a debugger in a sandbox)?", ""]
+    L += ["", "## Questions for the AI", ""] + \
+        [f"{i}. {q}" for i, q in enumerate(_ai_questions(info), 1)] + [""]
     return "\n".join(L)
 
 
@@ -5093,7 +5505,7 @@ def mcp_handle(msg):
         return ok({"protocolVersion": want if want in MCP_PROTOCOL_VERSIONS
                    else MCP_PROTOCOL_VERSIONS[0],
                    "capabilities": {"tools": {"listChanged": False}},
-                   "serverInfo": {"name": "neuralschema", "version": "0.4.0"},
+                   "serverInfo": {"name": "neuralschema", "version": "0.4.1"},
                    "instructions": "Static reverse engineering and code "
                    "architecture tools. Start with reverse_file, then drill in "
                    "with list_functions / disassemble / callers / find_strings. "
