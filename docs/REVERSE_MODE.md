@@ -55,6 +55,50 @@ Prompt-injection safety: everything quoted from the file sits inside code
 fences, labelled as untrusted data. Backticks from the file are neutralised,
 so a hostile string cannot close the fence and talk to the AI.
 
+## Connect any AI (0.4)
+
+The Studio's **Ask an AI** panel and the terminal's `--ask` can talk to any
+of these AI providers:
+
+| Provider | How it connects | Key |
+|---|---|---|
+| Ollama, LM Studio | Local, nothing leaves the computer | none |
+| OpenAI | `https://api.openai.com/v1` | `OPENAI_API_KEY` |
+| Anthropic Claude | `https://api.anthropic.com` (Messages API) | `ANTHROPIC_API_KEY` |
+| Google Gemini | `generativelanguage.googleapis.com/v1beta` | `GEMINI_API_KEY` / `GOOGLE_API_KEY` |
+| Groq, OpenRouter, DeepSeek, Mistral, Together, NVIDIA NIM (Nemotron) | Their OpenAI-compatible endpoints | `GROQ_API_KEY`, `OPENROUTER_API_KEY`, `DEEPSEEK_API_KEY`, `MISTRAL_API_KEY`, `TOGETHER_API_KEY`, `NVIDIA_API_KEY` |
+| **Custom** | **Any** OpenAI-compatible URL (vLLM, llama.cpp server, LiteLLM, company gateways…) | `NEURALSCHEMA_AI_KEY` + `NEURALSCHEMA_AI_BASE` |
+
+Underneath there are only four wire formats: OpenAI chat-completions,
+Anthropic messages, Gemini generateContent and Ollama generate. Adding a new
+provider means adding one line to `AI_PROVIDERS`.
+
+```bash
+# Terminal: analyse and ask in one go
+OPENAI_API_KEY=... python3 neural_schema.py --file app.exe --ask "What does it do?" \
+    --ai-provider openai --ai-model <model> --no-gui
+python3 neural_schema.py --list-models --ai-provider groq     # what models can I use?
+python3 neural_schema.py --file app.exe --ask "Is it malicious?" --ai-provider custom \
+    --ai-base https://my-gateway.example/v1 --ai-model my-model --no-gui
+```
+
+In the Studio, open **Connect: API key / base URL**, paste the key and press
+**Save connection**. If you also want the key kept on disk, tick
+**Remember on this computer**.
+
+**Where keys live, highest priority first:**
+1. A key typed in the Studio (server memory, this session only).
+2. `~/.config/neuralschema/ai.json`, created with `chmod 600`. `NEURALSCHEMA_AI_CONFIG` can point it elsewhere.
+3. Environment variables.
+
+**Key and privacy rules (enforced, and covered by tests):**
+- The browser never receives a key. After saving, the input is cleared and only `sk-…abcd` is shown.
+- Keys never appear in responses, error messages or the AI pack. Provider errors that echo the key have it replaced with `***`.
+- Gemini's key goes in a header, never in the URL, so it does not end up in logs.
+- Keys travel only over HTTPS. `http://` is refused for anything except this computer.
+- Choosing a cloud provider shows a warning that it will receive the AI pack. Use a local provider for confidential files.
+- Local models get a shorter slice of the pack (small context windows); cloud models get up to 150k characters.
+
 ## Reverse Studio (drag and drop)
 
 `python3 neural_schema.py --serve` opens `http://127.0.0.1:8765/`. Drop one or
@@ -63,7 +107,7 @@ more files anywhere on the window, or use **Open file…**. For each file you ge
 - the **Crawl Mode animation** of its structure (binary → sections → functions → calls / imports → capabilities),
 - the evidence panel (identity, protection chips, capability hints, loaded libraries, notes),
 - downloads: AI pack (.md), graph JSON, and the animation as a standalone .html,
-- **Ask local AI**: sends the AI pack plus your question to Ollama (`OLLAMA_HOST`, default `127.0.0.1:11434`). It runs fully offline.
+- **Ask an AI**: sends the AI pack plus your question to any connected provider (see above). Ollama or LM Studio keep it fully offline.
 
 The desktop GUI also accepts drops if `pip install tkinterdnd2` is present,
 and its **AI pack** button writes the same file.
@@ -154,7 +198,8 @@ the AI evidence instead of guesses, written independently in Python.
 | No objdump (e.g. plain Windows) | Everything except disassembly and call graph works; a note explains how to enable it |
 | Zip bomb | An extreme compression ratio is detected and nested extraction is skipped |
 | 5 GB model file | Refused above 512 MB. Model inspection of large GGUF files is a known limit (see below). |
-| Ollama not running | The Studio says so; the AI pack still works with any cloud AI |
+| Ollama not running / no key | The panel says which env var or connection is missing; the AI pack still works by copy-paste |
+| Provider error echoes your key | The key is replaced with `***` before anything is shown |
 | A binary whose strings try to instruct the AI | The strings are fenced, labelled untrusted, and backticks neutralised |
 
 ## Victory path

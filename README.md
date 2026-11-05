@@ -4,7 +4,12 @@ Universal Code & System Architecture Analyzer.
 
 ![Crawl Mode: a crawler exploring NeuralSchema's own source](docs/crawl-mode.jpg)
 
-> **New in 0.3 — Reverse Mode.** Drag & drop any `.exe`, `.dll`, ELF, `.so`,
+> **New in 0.4 — connect any AI.** Ollama, LM Studio, OpenAI, Claude, Gemini,
+> Groq, OpenRouter, DeepSeek, Mistral, Together, NVIDIA NIM or any
+> OpenAI-compatible URL: ask about a file in the Studio or with `--ask`.
+> Keys stay on your computer (never sent to the browser, HTTPS only).
+>
+> **0.3 — Reverse Mode.** Drag & drop any `.exe`, `.dll`, ELF, `.so`,
 > Mach-O, `.apk`, `.wasm`, `.gguf` or source file into the **Reverse Studio**
 > (`--serve`), get an evidence pack any AI can read (`--export aipack`), or let
 > any AI agent reverse files itself through the **MCP server** (`--mcp`).
@@ -66,10 +71,13 @@ python3 neural_schema.py --file app.exe --export aipack crawl --out ./out/ --no-
 
 # Let Claude Code / OpenCode / any MCP agent reverse files:
 claude mcp add neuralschema -- python3 /full/path/neural_schema.py --mcp
+
+# Ask any AI about it (local or cloud; key from env or the Studio):
+python3 neural_schema.py --file app.exe --ask "What does it do?" --ai-provider anthropic --ai-model <model> --no-gui
 ```
 
 Optional extras: `objdump` (binutils) for call graphs + disassembly,
-[Ollama](https://ollama.com) for the Studio's "Ask local AI",
+[Ollama](https://ollama.com) or any cloud AI key for "Ask an AI",
 `pip install tkinterdnd2` for drag & drop in the desktop GUI.
 Pairs with [REA](https://github.com/morluto/rea) for deep decompilation.
 
