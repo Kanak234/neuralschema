@@ -4,7 +4,13 @@ Universal Code & System Architecture Analyzer.
 
 ![Crawl Mode: a crawler exploring NeuralSchema's own source](docs/crawl-mode.jpg)
 
-> **New in 0.2 — Crawl Mode.** Watch a crawler discover your code, your OS or
+> **New in 0.3 — Reverse Mode.** Drag & drop any `.exe`, `.dll`, ELF, `.so`,
+> Mach-O, `.apk`, `.wasm`, `.gguf` or source file into the **Reverse Studio**
+> (`--serve`), get an evidence pack any AI can read (`--export aipack`), or let
+> any AI agent reverse files itself through the **MCP server** (`--mcp`).
+> See [docs/REVERSE_MODE.md](docs/REVERSE_MODE.md).
+>
+> **0.2 — Crawl Mode.** Watch a crawler discover your code, your OS or
 > a website node by node (BFS / DFS / real-crawl replay), as one offline HTML
 > page. See [docs/CRAWL_MODE.md](docs/CRAWL_MODE.md).
 
@@ -48,6 +54,24 @@ python3 neural_schema.py --system --top 50
 python3 neural_schema.py --file src/ --export html json png --out ./schema --no-gui
 python3 neural_schema.py --system --connections --export html --no-gui
 ```
+
+### Reverse Mode
+
+```bash
+# Drag-and-drop Studio (browser, local only):
+python3 neural_schema.py --serve
+
+# Any binary / package / model from the terminal:
+python3 neural_schema.py --file app.exe --export aipack crawl --out ./out/ --no-gui
+
+# Let Claude Code / OpenCode / any MCP agent reverse files:
+claude mcp add neuralschema -- python3 /full/path/neural_schema.py --mcp
+```
+
+Optional extras: `objdump` (binutils) for call graphs + disassembly,
+[Ollama](https://ollama.com) for the Studio's "Ask local AI",
+`pip install tkinterdnd2` for drag & drop in the desktop GUI.
+Pairs with [REA](https://github.com/morluto/rea) for deep decompilation.
 
 ### Crawl Mode
 

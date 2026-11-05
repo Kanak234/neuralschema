@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "neuralschema"
-version = "0.2.0"
-description = "Universal code & system architecture analyzer"
+version = "0.3.0"
+description = "Universal code, system & binary architecture analyzer with reverse-engineering studio and MCP server"
 readme = "README.md"
 authors = [{ name = "Kanak234" }]
 requires-python = ">=3.10"
