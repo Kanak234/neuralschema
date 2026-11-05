@@ -64,9 +64,17 @@ HAVE_OBJDUMP = shutil.which("objdump") is not None
 
 
 def _find_pe():
-    import setuptools
-    c = glob.glob(os.path.join(os.path.dirname(setuptools.__file__), "cli-64.exe"))
-    return c[0] if c else None
+    """A small real 64-bit Windows .exe shipped inside setuptools or pip.
+    Either package may be missing (e.g. Python 3.12+ venvs have no
+    setuptools), so look in both and skip the PE tests if neither has one."""
+    import importlib.util
+    for mod, pattern in (("setuptools", "cli-64.exe"), ("pip", "_vendor/distlib/t64.exe")):
+        spec = importlib.util.find_spec(mod)
+        if spec and spec.origin:
+            c = glob.glob(os.path.join(os.path.dirname(spec.origin), pattern))
+            if c:
+                return c[0]
+    return None
 
 
 PE = _find_pe()
