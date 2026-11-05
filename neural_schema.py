@@ -42,6 +42,10 @@ USAGE
     python3 neural_schema.py --file src/ --export html json png --out ./schema --no-gui
     python3 neural_schema.py --system --connections --export html --no-gui
 
+    # Crawl Mode -- animated "watch a crawler explore it" page (offline HTML):
+    python3 neural_schema.py --file src/ --export crawl --no-gui
+    python3 neural_schema.py --url https://example.com/ --strategy replay --export crawl --no-gui
+
 DEPENDENCIES
 ------------
     pip install psutil networkx matplotlib tree-sitter tree-sitter-language-pack pyvis
@@ -1949,6 +1953,1064 @@ pre {{ background: #040d21; padding: 12px; border-radius: 4px; overflow-x: auto;
 
 
 # ============================================================================
+#  CRAWL MODE  --  "watch a crawler explore the schema"
+# ============================================================================
+#
+#  WHY THIS EXISTS
+#  ---------------
+#  The normal views show the *finished* graph all at once.  For a big project
+#  that is a hairball -- you see everything and understand nothing.  Crawl
+#  Mode shows the SAME graph being *discovered* one node at a time, the way a
+#  search-engine crawler walks the web: start at a root, follow every link
+#  (here: contains / imports / calls / inherits / process-parent ...), queue
+#  what you find, repeat.  Watching the order of discovery teaches you the
+#  structure: what hangs off what, how deep the call chains go, which nodes
+#  are hubs.
+#
+#  WHAT IS IN THIS SECTION (and where each piece flows next)
+#  ---------------------------------------------------------
+#   1. WebCrawler      -> a real, polite website crawler (robots.txt, delay,
+#                         page cap).  Produces a normal SchemaGraph, so every
+#                         other NeuralSchema export (json/html/png/report)
+#                         also works on websites.            -> build_from_args
+#   2. crawl_order()   -> turns ANY SchemaGraph into an ordered list of
+#                         "discovery steps" (BFS, DFS, or a replay of the real
+#                         web crawl).                         -> export_crawl
+#   3. export_crawl()  -> writes ONE self-contained, offline HTML page that
+#                         animates those steps on a canvas (the reel look:
+#                         black canvas, neon link-tags, crawler heads).
+#                                                             -> CLI / GUI
+#
+#  Only the Python standard library is used here (urllib, html.parser,
+#  robotparser) so Crawl Mode adds ZERO new dependencies.
+# ----------------------------------------------------------------------------
+
+import hashlib                          # content fingerprint -> duplicate pages
+import html as _html                    # escaping the page <title>
+import time as _time                    # polite delay between requests
+from collections import deque           # BFS queue / DFS stack for the crawler
+from html.parser import HTMLParser      # stdlib HTML parser -> link extraction
+from urllib.error import HTTPError, URLError
+from urllib.parse import urldefrag, urljoin, urlparse
+from urllib.request import Request, urlopen
+from urllib.robotparser import RobotFileParser
+
+# --- new node kinds / relation for website graphs ---------------------------
+# Added to the SAME palette dicts the rest of the tool uses, so the Tkinter
+# GUI, PNG and pyvis exporters colour web graphs correctly for free.
+K_PAGE = "page"        # one URL on the crawled site
+K_SITE = "site"        # an OFF-site host that pages link to (aggregated)
+R_LINKS = "links-to"   # page --<a href>--> page / site
+KIND_COLOR[K_PAGE] = "#58a6ff"
+KIND_COLOR[K_SITE] = "#f778ba"
+REL_STYLE[R_LINKS] = ("#1f6feb", "solid")
+
+# Honest User-Agent: site owners can see who we are and block us in
+# robots.txt if they want.  Never pretend to be a browser.
+CRAWLER_UA = ("NeuralSchemaCrawler/1.0 "
+              "(+https://github.com/Kanak234/neuralschema)")
+
+
+def _update_node(sg, nid, **attrs):
+    """Change attributes of a node that already exists.
+
+    WHY: SchemaGraph.add_node() deliberately never overwrites (first writer
+    wins).  The crawler, however, learns things about a page AFTER it first
+    saw the link (its <title>, HTTP status...), so it needs a real update.
+    Keeps the fallback dict and the networkx graph in sync.
+    """
+    if nid not in sg._nodes:
+        return
+    sg._nodes[nid].update(attrs)
+    if sg.g is not None and nid in sg.g:
+        sg.g.nodes[nid].update(attrs)
+
+
+def normalize_url(base, href):
+    """Resolve `href` against `base` and canonicalise it, or return None.
+
+    WHY: the same page is reachable as "/a", "/a#top", "HTTP://Host:80/a" ...
+    Without canonical URLs the crawler would fetch one page many times and
+    the graph would show duplicates.  Non-web schemes (mailto:, javascript:,
+    tel:, data:) are dropped -- they are not pages.
+    """
+    href = (href or "").strip()
+    if not href or href.startswith("#"):
+        return None
+    if href.lower().startswith(("javascript:", "mailto:", "tel:", "data:")):
+        return None
+    try:
+        url = urldefrag(urljoin(base, href))[0]      # absolute, no #fragment
+        p = urlparse(url)
+    except ValueError:                               # e.g. bad IPv6 literal
+        return None
+    if p.scheme.lower() not in ("http", "https") or not p.netloc:
+        return None
+    netloc = p.netloc.lower()
+    # drop default ports so http://x:80/ == http://x/
+    if (p.scheme.lower() == "http" and netloc.endswith(":80")) or \
+       (p.scheme.lower() == "https" and netloc.endswith(":443")):
+        netloc = netloc.rsplit(":", 1)[0]
+    return p._replace(scheme=p.scheme.lower(), netloc=netloc,
+                      path=p.path or "/").geturl()
+
+
+class _LinkExtractor(HTMLParser):
+    """Collects <a href>, the <title>, and a page-level `nofollow` flag.
+
+    WHY a stdlib parser and not regex: real HTML is messy; HTMLParser copes
+    with broken markup and decodes &amp; entities for us.
+    Flows into: WebCrawler.crawl(), which normalises every href.
+    """
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.links = []
+        self._title = []
+        self._in_title = False
+        self.nofollow = False          # <meta name="robots" content="nofollow">
+
+    def handle_starttag(self, tag, attrs):
+        a = {k: (v or "") for k, v in attrs}
+        if tag == "a" and a.get("href"):
+            # respect per-link rel="nofollow" as well
+            if "nofollow" not in a.get("rel", "").lower():
+                self.links.append(a["href"])
+        elif tag == "title":
+            self._in_title = True
+        elif tag == "meta" and a.get("name", "").lower() == "robots":
+            if "nofollow" in a.get("content", "").lower():
+                self.nofollow = True
+
+    def handle_endtag(self, tag):
+        if tag == "title":
+            self._in_title = False
+
+    def handle_data(self, data):
+        if self._in_title:
+            self._title.append(data)
+
+    @property
+    def title(self):
+        return " ".join("".join(self._title).split())[:120]
+
+
+class WebCrawler:
+    """A small, POLITE website crawler that outputs a SchemaGraph.
+
+    Politeness rules (these are what separate a crawler from an attack tool):
+      * obeys robots.txt (and its Crawl-delay) for every host,
+      * waits `delay` seconds between requests (default 1 s),
+      * stops after `max_pages` fetches,
+      * sends an honest User-Agent,
+      * only reads the first `max_bytes` of a page and only parses HTML.
+
+    Every discovered URL becomes a node carrying `disc_step`, `disc_parent`
+    and `depth`.  crawl_order(strategy="replay") uses exactly those fields to
+    replay the REAL crawl order in the animation.
+    """
+
+    def __init__(self, max_pages=40, same_domain=True, delay=1.0, timeout=10,
+                 strategy="bfs", max_external=30, respect_robots=True,
+                 user_agent=CRAWLER_UA, max_bytes=2_000_000,
+                 max_links_per_page=200):
+        self.max_pages = max(1, int(max_pages))
+        self.same_domain = same_domain
+        self.delay = max(0.0, float(delay))
+        self.timeout = timeout
+        self.strategy = "dfs" if strategy == "dfs" else "bfs"
+        self.max_external = max_external
+        self.respect_robots = respect_robots
+        self.user_agent = user_agent
+        self.max_bytes = max_bytes
+        self.max_links_per_page = max_links_per_page
+        self._robots = {}        # "scheme://host" -> RobotFileParser
+        self._host_delay = {}    # "scheme://host" -> Crawl-delay from robots
+        self._last_hit = {}      # "scheme://host" -> time of last request
+
+    # -- networking ---------------------------------------------------------
+    def _fetch(self, url, max_bytes=None):
+        """GET one URL.  Returns (status, content_type, body|None, final_url,
+        error|None).  Never raises -- a crawler must survive bad pages."""
+        cap = max_bytes or self.max_bytes
+        req = Request(url, headers={
+            "User-Agent": self.user_agent,
+            "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.5"})
+        try:
+            with urlopen(req, timeout=self.timeout) as r:
+                ctype = r.headers.get("Content-Type", "") or ""
+                body = r.read(cap + 1)[:cap]
+                return r.status, ctype, body, r.geturl(), None
+        except HTTPError as e:
+            ctype = (e.headers.get("Content-Type", "") if e.headers else "") or ""
+            return e.code, ctype, None, url, f"HTTP {e.code}"
+        except (URLError, socket.timeout, OSError, ValueError) as e:
+            reason = getattr(e, "reason", e)
+            return None, "", None, url, str(reason)
+
+    def _host_key(self, url):
+        p = urlparse(url)
+        return f"{p.scheme}://{p.netloc}"
+
+    def _allowed(self, url):
+        """True if robots.txt lets us fetch `url` (cached per host).
+
+        Status handling follows common crawler practice:
+          200      -> parse the rules
+          401/403  -> the site is protecting itself: disallow everything
+          other 4xx (e.g. 404) -> no robots.txt: everything allowed
+          5xx / network error  -> unknown: be conservative, disallow
+        """
+        if not self.respect_robots:
+            return True
+        key = self._host_key(url)
+        rp = self._robots.get(key)
+        if rp is None:
+            rp = RobotFileParser()
+            status, _ct, body, _u, _err = self._fetch(key + "/robots.txt",
+                                                      max_bytes=500_000)
+            self._last_hit[key] = _time.monotonic()
+            if status == 200 and body is not None:
+                rp.parse(body.decode("utf-8", "replace").splitlines())
+            elif status in (401, 403):
+                rp.disallow_all = True
+            elif status is not None and 400 <= status < 500:
+                rp.allow_all = True
+            else:
+                rp.disallow_all = True
+            try:
+                cd = rp.crawl_delay(self.user_agent)
+                if cd:
+                    self._host_delay[key] = float(cd)
+            except Exception:
+                pass
+            self._robots[key] = rp
+        return rp.can_fetch(self.user_agent, url)
+
+    def _wait_turn(self, url):
+        """Sleep so that requests to one host are at least `delay` apart
+        (or the robots Crawl-delay, whichever is larger)."""
+        key = self._host_key(url)
+        gap = max(self.delay, self._host_delay.get(key, 0.0))
+        last = self._last_hit.get(key)
+        if last is not None and gap > 0:
+            wait = gap - (_time.monotonic() - last)
+            if wait > 0:
+                _time.sleep(wait)
+        self._last_hit[key] = _time.monotonic()
+
+    # -- the crawl itself ---------------------------------------------------
+    def crawl(self, start_url, progress=None):
+        """Crawl from `start_url`; return a SchemaGraph of pages and links.
+
+        progress(fetched, max_pages, url) is called after every fetch so the
+        CLI can show a live counter.
+        """
+        start = normalize_url(start_url, start_url)
+        if start is None:
+            raise ValueError(f"not an http(s) URL: {start_url!r}")
+        root_host = urlparse(start).netloc
+        sg = SchemaGraph(title=f"crawl {root_host}", kind="web",
+                         language="html", source=start)
+
+        disc = [0]                      # discovery counter (list = mutable)
+        content_seen = {}               # sha1(page bytes) -> first node id
+        seen_edges = set()
+        site_nodes = {}                 # off-site host -> node id
+
+        def pid(u):
+            return "url:" + u
+
+        def discover(u, parent_id, depth):
+            """Register a NEW url as a node, remembering how we found it."""
+            p = urlparse(u)
+            label = (p.path + ("?" + p.query if p.query else "")) or "/"
+            if p.netloc != root_host:
+                label = p.netloc + label
+            sg.add_node(pid(u), K_PAGE, label[:80], url=u, depth=depth,
+                        disc_step=disc[0], disc_parent=parent_id,
+                        disc_relation=R_LINKS if parent_id else None,
+                        status="queued", fetched=False)
+            disc[0] += 1
+
+        def link(src, dst):
+            if (src, dst) not in seen_edges:
+                seen_edges.add((src, dst))
+                sg.add_edge(src, dst, R_LINKS)
+
+        discover(start, None, 0)
+        frontier = deque([(start, 0)])
+        seen = {start}
+        fetched = 0
+
+        while frontier and fetched < self.max_pages:
+            # BFS takes the OLDEST url (wide, level by level);
+            # DFS takes the NEWEST (dives down one path first).
+            url, depth = (frontier.popleft() if self.strategy == "bfs"
+                          else frontier.pop())
+            nid = pid(url)
+            if not self._allowed(url):
+                _update_node(sg, nid, status="blocked by robots.txt",
+                             blocked=True)
+                continue
+
+            self._wait_turn(url)
+            status, ctype, body, final_url, err = self._fetch(url)
+            fetched += 1
+            _update_node(sg, nid, fetched=True, fetch_order=fetched,
+                         status=status if status is not None else "error",
+                         content_type=ctype.split(";")[0].strip(),
+                         **({"error": err} if err else {}))
+            if progress:
+                progress(fetched, self.max_pages, url)
+
+            if body is None or ("html" not in ctype.lower() and ctype):
+                continue                # images, PDFs, errors: leaf nodes
+
+            # Same bytes under a different URL ("/" vs "/index.html", tracking
+            # params...)?  Real crawlers de-duplicate by content; we mark it
+            # and do not follow its links twice.
+            digest = hashlib.sha1(body).hexdigest()
+            twin = content_seen.get(digest)
+            if twin is not None:
+                _update_node(sg, nid, duplicate_of=sg.nodes()[twin].get("url"))
+                continue
+            content_seen[digest] = nid
+
+            # decode with the server's charset if it told us one
+            charset = "utf-8"
+            if "charset=" in ctype.lower():
+                charset = ctype.lower().split("charset=")[-1].split(";")[0].strip() or "utf-8"
+            try:
+                text = body.decode(charset, "replace")
+            except LookupError:
+                text = body.decode("utf-8", "replace")
+
+            parser = _LinkExtractor()
+            try:
+                parser.feed(text)
+            except Exception:
+                pass                    # keep whatever was parsed
+            if parser.title:
+                _update_node(sg, nid, label=parser.title[:80],
+                             title=parser.title)
+            if parser.nofollow:
+                _update_node(sg, nid, nofollow=True)
+                continue
+
+            base = final_url or url
+            for href in parser.links[: self.max_links_per_page]:
+                u = normalize_url(base, href)
+                if u is None:
+                    continue
+                host = urlparse(u).netloc
+                if self.same_domain and host != root_host:
+                    # off-site: ONE node per host, never fetched
+                    sid = site_nodes.get(host)
+                    if sid is None:
+                        if len(site_nodes) >= self.max_external:
+                            continue
+                        sid = "site:" + host
+                        site_nodes[host] = sid
+                        sg.add_node(sid, K_SITE, host, url=f"https://{host}/",
+                                    depth=depth + 1, disc_step=disc[0],
+                                    disc_parent=nid, disc_relation=R_LINKS)
+                        disc[0] += 1
+                    link(nid, sid)
+                    continue
+                if u not in seen:
+                    seen.add(u)
+                    discover(u, nid, depth + 1)
+                    frontier.append((u, depth + 1))
+                link(nid, pid(u))
+
+        # anything still queued was skipped because of the page cap
+        for url, _d in frontier:
+            n = sg.nodes().get(pid(url))
+            if n is not None and not n.get("fetched") and not n.get("blocked"):
+                _update_node(sg, pid(url), status="not crawled (page cap)")
+        return sg
+
+
+# ----------------------------------------------------------------------------
+#  crawl_order -- turn any graph into a sequence of discovery steps
+# ----------------------------------------------------------------------------
+
+# Which node a crawl should START from (lower = better root).
+_ROOT_RANK = {K_PROJECT: 0, K_SYSTEM: 0, K_MODULE: 1, K_PAGE: 1,
+              K_NAMESPACE: 2, K_CLASS: 3, K_STRUCT: 3, K_INTERFACE: 3}
+# In which order a node's neighbours are visited (lower = first), so the
+# crawl reads naturally: modules, then types, then functions, then the rest.
+_VISIT_RANK = {K_MODULE: 0, K_NAMESPACE: 1, K_CLASS: 2, K_STRUCT: 2,
+               K_INTERFACE: 2, K_FUNCTION: 3, K_METHOD: 3, K_PAGE: 3,
+               K_IMPORT: 5, K_EXTERNAL: 6, K_SITE: 6, K_VULN: 4}
+
+
+def crawl_order(sg, strategy="bfs", start=None):
+    """Return the order in which a crawler would discover `sg`'s nodes.
+
+    Each step is a dict: {"id", "parent", "rel", "depth", "out"}; parent is
+    None for a root.  "out" is False when the crawler walked an edge
+    BACKWARDS (e.g. reached a function from something it calls) so the
+    viewer can say "called by" instead of "calls".  EVERY node appears exactly once (disconnected islands get
+    their own new root), so the animation always ends with the full graph.
+
+    strategy:
+      "bfs"    -- breadth-first: whole level, then the next (wide wave)
+      "dfs"    -- depth-first : follow one chain to the bottom, then back up
+      "replay" -- the real order a WebCrawler found things (needs disc_step
+                  on every node; otherwise falls back to "bfs")
+    Edges are walked in BOTH directions (callers are reachable from callees)
+    but outgoing edges are preferred, so the crawl follows the arrows first.
+    """
+    nodes = sg.nodes()
+    if not nodes:
+        return []
+
+    if strategy == "replay":
+        if all("disc_step" in a for a in nodes.values()):
+            out = []
+            for nid, a in sorted(nodes.items(), key=lambda kv: kv[1]["disc_step"]):
+                par = a.get("disc_parent")
+                out.append({"id": nid,
+                            "parent": par if par in nodes else None,
+                            "rel": a.get("disc_relation") if par in nodes else None,
+                            "depth": int(a.get("depth", 0)), "out": True})
+            return out
+        strategy = "bfs"
+
+    # adjacency: node -> [(neighbour, relation, is_outgoing)]
+    adj = defaultdict(list)
+    for s, d, r in sg.edges():
+        if s in nodes and d in nodes and s != d:
+            adj[s].append((d, r, True))
+            adj[d].append((s, r, False))
+
+    def nb_key(item):
+        nb, _r, outgoing = item
+        a = nodes[nb]
+        return (not outgoing, _VISIT_RANK.get(a["kind"], 7),
+                str(a["label"]).lower(), str(nb))
+
+    for k in list(adj):
+        uniq, seen_nb = [], set()
+        for item in sorted(adj[k], key=nb_key):
+            if item[0] not in seen_nb:          # keep the best edge per pair
+                seen_nb.add(item[0])
+                uniq.append(item)
+        adj[k] = uniq
+
+    deg = sg.degree()
+    seeds = sorted(nodes, key=lambda n: (_ROOT_RANK.get(nodes[n]["kind"], 9),
+                                         -deg.get(n, 0),
+                                         str(nodes[n]["label"]).lower(), str(n)))
+    if start is not None:
+        # accept an id or a label
+        if start not in nodes:
+            match = [n for n, a in nodes.items() if a["label"] == start]
+            start = match[0] if match else None
+        if start is not None:
+            seeds.insert(0, start)
+
+    visited, steps = set(), []
+    for seed in seeds:
+        if seed in visited:
+            continue
+        visited.add(seed)
+        steps.append({"id": seed, "parent": None, "rel": None, "depth": 0,
+                      "out": True})
+        if strategy == "dfs":
+            # iterative pre-order DFS (no recursion limit on deep call chains)
+            stack = [(seed, iter(adj[seed]), 0)]
+            while stack:
+                n, it, dp = stack[-1]
+                for nb, r, o in it:
+                    if nb not in visited:
+                        visited.add(nb)
+                        steps.append({"id": nb, "parent": n, "rel": r,
+                                      "depth": dp + 1, "out": o})
+                        stack.append((nb, iter(adj[nb]), dp + 1))
+                        break
+                else:
+                    stack.pop()            # all neighbours done -> backtrack
+        else:
+            q = deque([(seed, 0)])
+            while q:
+                n, dp = q.popleft()
+                for nb, r, o in adj[n]:
+                    if nb not in visited:
+                        visited.add(nb)
+                        steps.append({"id": nb, "parent": n, "rel": r,
+                                      "depth": dp + 1, "out": o})
+                        q.append((nb, dp + 1))
+    return steps
+
+
+# ----------------------------------------------------------------------------
+#  export_crawl -- the animated, offline HTML page
+# ----------------------------------------------------------------------------
+
+def _find_logo(logo_path=None):
+    """Locate Kanak's KP watermark (logo-mark.svg).
+
+    Looks at an explicit path, then next to this script, then the current
+    folder.  Returns a data: URI or None (the page then shows a text badge).
+    """
+    import base64
+    cands = [logo_path] if logo_path else []
+    cands += [os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "logo-mark.svg"),
+              os.path.join(os.getcwd(), "logo-mark.svg")]
+    for c in cands:
+        if c and os.path.isfile(c):
+            with open(c, "rb") as f:
+                raw = f.read(512_000)
+            return "data:image/svg+xml;base64," + base64.b64encode(raw).decode()
+    return None
+
+
+def crawl_payload(sg, algo="spring", strategies=("bfs", "dfs"), logo_path=None):
+    """Pack the graph + discovery orders into compact JSON-able data.
+
+    Nodes/edges/steps are stored as index arrays (not long id strings) so a
+    2,000-node project still produces a small file that loads instantly.
+    """
+    nodes = sg.nodes()
+    ids = list(nodes)
+    index = {nid: i for i, nid in enumerate(ids)}
+
+    # layout -> plain floats normalised into [-1, 1] keeping the aspect ratio
+    pos = compute_layout(sg, algo) if ids else {}
+    xs = [float(pos[n][0]) for n in ids] or [0.0]
+    ys = [float(pos[n][1]) for n in ids] or [0.0]
+    cx, cy = (max(xs) + min(xs)) / 2, (max(ys) + min(ys)) / 2
+    span = max(max(xs) - min(xs), max(ys) - min(ys)) / 2 or 1.0
+
+    kinds = sorted({a["kind"] for a in nodes.values()})
+    rels = sorted({r for _s, _d, r in sg.edges()} | {R_LINKS})
+    kind_i = {k: i for i, k in enumerate(kinds)}
+    rel_i = {r: i for i, r in enumerate(rels)}
+
+    def short(v, n=160):
+        s = str(v)
+        return s if len(s) <= n else s[: n - 1] + "…"
+
+    out_nodes = []
+    for i, nid in enumerate(ids):
+        a = nodes[nid]
+        meta = {k: short(v) for k, v in a.items()
+                if k not in ("kind", "label", "disc_step", "disc_parent",
+                             "disc_relation") and v not in (None, "")}
+        meta = dict(list(meta.items())[:14])
+        out_nodes.append([round((xs[i] - cx) / span, 4),
+                          round(-(ys[i] - cy) / span, 4),   # y up -> screen
+                          kind_i[a["kind"]], short(a["label"], 60), meta])
+
+    edges = [[index[s], index[d], rel_i[r]] for s, d, r in sg.edges()
+             if s in index and d in index and s != d]
+
+    orders = {}
+    want = list(strategies)
+    if all("disc_step" in a for a in nodes.values()) and nodes:
+        want = ["replay"] + [s for s in want if s != "replay"]
+    for st in want:
+        steps = crawl_order(sg, st)
+        orders[st] = [[index[s["id"]],
+                       index[s["parent"]] if s["parent"] is not None else -1,
+                       rel_i.get(s["rel"], -1) if s["rel"] else -1,
+                       s["depth"], 1 if s.get("out", True) else 0]
+                      for s in steps]
+
+    return {
+        "title": sg.title, "kind": sg.kind, "language": sg.language,
+        "source": short(sg.source or "", 200),
+        "kinds": kinds,
+        "kindColors": [KIND_COLOR.get(k, "#8b949e") for k in kinds],
+        "rels": rels,
+        "relColors": [REL_STYLE.get(r, ("#484f58", "solid"))[0] for r in rels],
+        "nodes": out_nodes, "edges": edges, "orders": orders,
+        "logo": _find_logo(logo_path),
+        "generated": datetime.datetime.now().isoformat(timespec="seconds"),
+    }
+
+
+def export_crawl(sg, out_path, algo="spring", strategy="bfs", logo_path=None):
+    """Write the animated crawl page for `sg` to `out_path` (one .html file).
+
+    The page needs no internet and no server: double-click it.
+    `strategy` only picks which order plays first; the viewer can switch.
+    """
+    os.makedirs(os.path.dirname(os.path.abspath(out_path)) or ".", exist_ok=True)
+    data = crawl_payload(sg, algo=algo, logo_path=logo_path)
+    if strategy in data["orders"]:
+        data["initial"] = strategy
+    else:
+        data["initial"] = next(iter(data["orders"]), "bfs")
+    # A raw "<" must never appear inside <script>: a node label like
+    # "</script><script>alert(1)" (or "<!--") would otherwise break out of
+    # the JSON block.  < is the same character to JSON.parse, but
+    # invisible to the HTML parser.  Same for ">" and "&" for good measure.
+    blob = (json.dumps(data, separators=(",", ":"), default=str,
+                       ensure_ascii=False)
+            .replace("<", "\\u003c").replace(">", "\\u003e")
+            .replace("&", "\\u0026"))
+    page = (_CRAWL_TEMPLATE
+            .replace("__TITLE__", _html.escape(f"NeuralSchema crawl — {sg.title}"))
+            .replace("__DATA__", blob))
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(page)
+    return out_path
+
+
+# The template lives in its own file-level string so the Python above stays
+# readable.  It is plain HTML/CSS/JS -- no CDN, works fully offline.
+_CRAWL_TEMPLATE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__</title>
+<meta name="description" content="Animated crawl of a NeuralSchema architecture graph, generated offline by NeuralSchema.">
+<style>
+/* ------------------------------------------------------------------
+   Look: the reel -- pure black canvas, white headline, neon tags.
+   All colours are tokens so the page stays consistent.
+   ------------------------------------------------------------------ */
+:root{
+  --bg:#000; --panel:rgba(10,12,18,.78); --line:rgba(255,255,255,.12);
+  --text:#f0f3f8; --dim:#9aa4b2; --accent:#58a6ff; --hot:#ff3eb5;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Liberation Mono",monospace;
+  --sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;background:var(--bg);color:var(--text);font-family:var(--sans);overflow:hidden}
+canvas{position:fixed;inset:0;width:100%;height:100%;display:block;cursor:grab;touch-action:none}
+canvas.drag{cursor:grabbing}
+/* headline, top-left, like the reel */
+#head{position:fixed;left:24px;top:20px;max-width:min(560px,calc(100vw - 48px));pointer-events:none}
+#head h1{margin:0;font-weight:500;font-size:clamp(20px,3.2vw,34px);line-height:1.15;letter-spacing:-.01em}
+#head p{margin:6px 0 0;color:var(--dim);font:12px var(--mono);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+/* stats + log, top-right */
+#hud{position:fixed;right:16px;top:16px;width:260px;background:var(--panel);border:1px solid var(--line);
+  border-radius:10px;padding:12px 14px;font:12px var(--mono);backdrop-filter:blur(6px)}
+#hud .row{display:flex;justify-content:space-between;gap:8px;margin:2px 0}
+#hud .row b{color:var(--text);font-weight:600}
+#hud .k{color:var(--dim)}
+#bar{height:4px;background:rgba(255,255,255,.1);border-radius:2px;margin:8px 0 10px;overflow:hidden}
+#bar i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--accent),var(--hot))}
+#log{margin-top:8px;border-top:1px solid var(--line);padding-top:8px;height:118px;overflow:hidden}
+#log div{white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--dim);line-height:19px}
+#log div:first-child{color:var(--text)}
+#log span{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:6px;vertical-align:0}
+#legend{margin-top:8px;border-top:1px solid var(--line);padding-top:8px;display:flex;flex-wrap:wrap;gap:4px 10px;color:var(--dim)}
+#legend span{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:4px}
+/* controls, bottom */
+#ctl{position:fixed;left:50%;bottom:16px;transform:translateX(-50%);display:flex;flex-wrap:wrap;align-items:center;
+  gap:8px 12px;background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:10px 14px;
+  font:12px var(--sans);width:min(940px,calc(100vw - 32px));backdrop-filter:blur(6px)}
+#ctl button,#ctl select{font:inherit;color:var(--text);background:#151a24;border:1px solid #2a3242;border-radius:8px;
+  padding:7px 11px;cursor:pointer;min-height:34px}
+#ctl button:hover,#ctl select:hover{border-color:var(--accent)}
+#ctl button:focus-visible,#ctl select:focus-visible,#ctl input:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+#ctl button.on{background:#1f3a66;border-color:var(--accent)}
+#ctl label{display:flex;align-items:center;gap:6px;color:var(--dim)}
+#ctl input[type=range]{accent-color:var(--accent);width:90px}
+#tl{flex:1 1 180px;display:flex;align-items:center;gap:8px}
+#tl input{flex:1;width:auto}
+#tl output{font-family:var(--mono);color:var(--dim);min-width:84px;text-align:right}
+/* node details, left */
+#info{position:fixed;left:16px;bottom:96px;width:300px;max-height:45vh;overflow:auto;background:var(--panel);
+  border:1px solid var(--line);border-radius:10px;padding:12px 14px;font:12px var(--mono);display:none}
+#info h2{margin:0 0 6px;font:600 14px var(--sans);word-break:break-word}
+#info table{border-collapse:collapse;width:100%}
+#info td{padding:2px 0;vertical-align:top;word-break:break-word}
+#info td:first-child{color:var(--dim);padding-right:10px;white-space:nowrap}
+#info .x{float:right;background:none;border:0;color:var(--dim);cursor:pointer;font-size:16px}
+/* watermark */
+#wm{position:fixed;right:16px;bottom:96px;display:flex;align-items:center;gap:6px;opacity:.55;font:11px var(--sans);
+  color:var(--dim);pointer-events:none}
+#wm img{height:22px;width:auto}
+#wm b{display:inline-grid;place-items:center;width:22px;height:22px;border:1px solid var(--dim);border-radius:50%;font-size:9px;color:var(--text)}
+#empty{position:fixed;inset:0;display:none;place-items:center;color:var(--dim);font:14px var(--sans)}
+.sr{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0)}
+@media (max-width:760px){
+  #hud{width:auto;left:16px;right:16px;top:104px;padding:8px 12px}
+  #log,#legend{display:none}
+  #head{top:14px;left:16px}
+  #info{left:16px;right:16px;width:auto;bottom:186px;max-height:30vh}
+  #wm{bottom:186px;right:16px}
+  #ctl{bottom:10px;gap:6px 8px;padding:8px 10px}
+  #ctl input[type=range]{width:70px}
+}
+</style>
+</head>
+<body>
+<canvas id="cv" aria-label="Animated graph of a crawler discovering nodes" role="img"></canvas>
+<div id="head"><h1 id="h1">This Animation Shows How a Crawler Explores Your Code</h1><p id="sub"></p></div>
+
+<div id="hud" aria-live="off">
+  <div class="row"><span class="k">discovered</span><b id="sDone">0</b></div>
+  <div id="bar"><i></i></div>
+  <div class="row"><span class="k">frontier (queued)</span><b id="sFront">0</b></div>
+  <div class="row"><span class="k">depth</span><b id="sDepth">0</b></div>
+  <div class="row"><span class="k">links followed</span><b id="sLinks">0</b></div>
+  <div id="log"></div>
+  <div id="legend"></div>
+</div>
+
+<div id="info" role="dialog" aria-label="Node details"><button class="x" id="infoX" aria-label="Close details">×</button><h2 id="iT"></h2><table id="iTab"></table></div>
+<div id="wm"></div>
+<div id="empty">Nothing to crawl — the schema has no nodes.</div>
+
+<div id="ctl">
+  <button id="bPlay" aria-label="Play or pause (Space)">❚❚ Pause</button>
+  <button id="bRe" aria-label="Restart (R)">↺ Restart</button>
+  <label>Order <select id="sMode" aria-label="Crawl order"></select></label>
+  <label>Speed <input id="rSpeed" type="range" min="0" max="100" value="55" aria-label="Speed"></label>
+  <label>Crawlers <input id="rW" type="range" min="1" max="8" value="3" aria-label="Parallel crawlers"></label>
+  <button id="bFollow" class="on" aria-pressed="true" aria-label="Camera follows the crawl (F)">◎ Follow</button>
+  <button id="bTags" class="on" aria-pressed="true" aria-label="Show link tags (T)">▭ Tags</button>
+  <div id="tl"><input id="rT" type="range" min="0" max="1000" value="0" step="1" aria-label="Timeline"><output id="oT">0 / 0</output></div>
+</div>
+<p class="sr">Keyboard: Space play/pause, R restart, F follow, T tags, arrow keys step. Drag to pan, wheel to zoom, click a node for details.</p>
+
+<script type="application/json" id="ns-data">__DATA__</script>
+<script>
+/* =====================================================================
+   NeuralSchema · Crawl Mode player
+   ---------------------------------------------------------------------
+   DATA  (built by crawl_payload() in neural_schema.py)
+     nodes  : [x, y, kindIndex, label, meta]   (x,y already in [-1,1])
+     edges  : [srcIndex, dstIndex, relIndex]
+     orders : {bfs|dfs|replay : [[node, parent, rel, depth, out], ...]}
+              out = 1 if the edge was walked along its arrow, 0 if backwards
+   TIME MODEL
+     Step i STARTS at time i / W (W = parallel crawlers) and takes 1 time
+     unit to travel parent -> node.  So at time t:
+       done      = steps with  i/W + 1 <= t
+       in flight = steps with  i/W <= t < i/W + 1
+     Everything below (drawing, HUD, timeline) is a pure function of t,
+     which is why scrubbing backwards "just works".
+   ===================================================================== */
+"use strict";
+const D = JSON.parse(document.getElementById("ns-data").textContent);
+const N = D.nodes.length;
+const cv = document.getElementById("cv"), ctx = cv.getContext("2d");
+const $ = id => document.getElementById(id);
+
+/* ---- headline: reel wording, adapted to what we are crawling ---- */
+const what = D.kind === "web" ? "a Website" : D.kind === "system" ? "Your System" : "Your Code";
+$("h1").textContent = "This Animation Shows How a Crawler Explores " + what;
+const srcTail = String(D.source || "").split(/[\\/]/).pop();
+$("sub").textContent = (D.title || "") + (D.source && srcTail !== D.title && D.source !== D.title ? "  ·  " + D.source : "");
+
+/* ---- watermark: Kanak's KP logo if embedded, else a text badge ---- */
+(function(){
+  const wm = $("wm");
+  if (D.logo) { const im = new Image(); im.src = D.logo; im.alt = "KP"; wm.appendChild(im); }
+  else { const b = document.createElement("b"); b.textContent = "KP"; wm.appendChild(b); }
+  wm.appendChild(document.createTextNode("NeuralSchema"));
+})();
+
+if (!N) { $("empty").style.display = "grid"; $("hud").style.display = "none"; }
+
+/* ---- per-node lookups used every frame ---- */
+const X = new Float32Array(N), Y = new Float32Array(N), K = new Uint8Array(N);
+D.nodes.forEach((n, i) => { X[i] = n[0]; Y[i] = n[1]; K[i] = n[2]; });
+// stable pseudo-random per node (so tags keep their tilt between frames)
+function hash(s){ let h = 2166136261; for (let i = 0; i < s.length; i++){ h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return h >>> 0; }
+const TILT = new Float32Array(N);
+D.nodes.forEach((n, i) => { const h = hash(String(n[3]) + i); TILT[i] = (h % 6 === 0) ? ((h >> 4) % 2 ? 1 : -1) * (0.35 + ((h >> 8) % 30) / 100) : 0; });
+// neighbour lists for the click-highlight
+const NB = Array.from({length: N}, () => []);
+D.edges.forEach(e => { NB[e[0]].push(e[1]); NB[e[1]].push(e[0]); });
+
+/* ---- legend ---- */
+D.kinds.forEach((k, i) => {
+  const el = document.createElement("div"); const sw = document.createElement("span");
+  sw.style.background = D.kindColors[i]; el.appendChild(sw); el.appendChild(document.createTextNode(k)); $("legend").appendChild(el);
+});
+
+/* ---- order selector ---- */
+const NAMES = {bfs: "Breadth-first (BFS)", dfs: "Depth-first (DFS)", replay: "Real crawl (replay)"};
+Object.keys(D.orders).forEach(k => { const o = document.createElement("option"); o.value = k; o.textContent = NAMES[k] || k; $("sMode").appendChild(o); });
+
+/* =====================================================================
+   STATE
+   ===================================================================== */
+const reduce = window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches;
+let mode = D.initial || Object.keys(D.orders)[0] || "bfs";
+let S = [];                 // current steps
+let rank = new Int32Array(N);  // node -> step index (when it gets discovered)
+let lastChild = new Int32Array(0); // step -> index of its last child step (for frontier)
+let t = 0, playing = !reduce && N > 0, W = 3, speed = 6;
+let follow = true, tags = N <= 1500, selected = -1;
+let cam = {x: 0, y: 0, s: 1}, camT = {x: 0, y: 0, s: 1};
+let dpr = 1, vw = 0, vh = 0;
+
+function setMode(m){
+  mode = m; S = D.orders[m] || [];
+  rank.fill(-1);
+  S.forEach((s, i) => { rank[s[0]] = i; });
+  lastChild = new Int32Array(S.length).fill(-1);
+  S.forEach((s, i) => { if (s[1] >= 0 && rank[s[1]] >= 0) lastChild[rank[s[1]]] = i; });
+  $("sMode").value = m; t = 0; selected = -1; $("info").style.display = "none";
+  // 1 crawler for tiny graphs looks best; many for huge ones so it finishes
+  if (S.length > 1500 && W < 6) { W = 6; $("rW").value = 6; }
+}
+const totalT = () => S.length ? (S.length - 1) / W + 1 : 0;
+function speedFromSlider(v){ return 0.4 * Math.pow(1.055, v); }      // 0.4 .. ~84 steps/s
+speed = speedFromSlider(+$("rSpeed").value);
+if (!tags) $("bTags").classList.remove("on");
+
+/* =====================================================================
+   CAMERA  world [-1,1] -> screen pixels
+   ===================================================================== */
+function resize(){
+  dpr = Math.min(window.devicePixelRatio || 1, 2);
+  vw = innerWidth; vh = innerHeight;
+  cv.width = vw * dpr; cv.height = vh * dpr;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+addEventListener("resize", resize); resize();
+const base = () => Math.min(vw, vh) * 0.42;
+const sx = x => vw / 2 + (x - cam.x) * cam.s * base();
+const sy = y => vh / 2 + (y - cam.y) * cam.s * base();
+const wx = px => (px - vw / 2) / (cam.s * base()) + cam.x;
+const wy = py => (py - vh / 2) / (cam.s * base()) + cam.y;
+
+/* =====================================================================
+   DRAWING
+   ===================================================================== */
+const ease = u => u < 0 ? 0 : u > 1 ? 1 : 1 - Math.pow(1 - u, 3);
+function rgba(hex, a){ const n = parseInt(hex.slice(1), 16); return `rgba(${n>>16&255},${n>>8&255},${n&255},${a})`; }
+function roundRect(x, y, w, h, r){ ctx.beginPath(); ctx.moveTo(x+r, y); ctx.arcTo(x+w, y, x+w, y+h, r); ctx.arcTo(x+w, y+h, x, y+h, r); ctx.arcTo(x, y+h, x, y, r); ctx.arcTo(x, y, x+w, y, r); ctx.closePath(); }
+
+function frame(){
+  const T = totalT();
+  const doneN = Math.max(0, Math.min(S.length, Math.floor((t - 1) * W) + 1));   // steps fully arrived
+  const startN = Math.max(0, Math.min(S.length, Math.floor(t * W) + 1));       // steps started
+
+  /* --- camera: fit everything discovered so far (+ in flight targets) --- */
+  if (follow && S.length){
+    let x0 = 1e9, y0 = 1e9, x1 = -1e9, y1 = -1e9;
+    const upto = Math.max(1, startN);
+    for (let i = 0; i < upto; i++){ const n = S[i][0]; if (X[n] < x0) x0 = X[n]; if (X[n] > x1) x1 = X[n]; if (Y[n] < y0) y0 = Y[n]; if (Y[n] > y1) y1 = Y[n]; }
+    const w = Math.max(x1 - x0, 0.35), h = Math.max(y1 - y0, 0.35);
+    camT.x = (x0 + x1) / 2; camT.y = (y0 + y1) / 2;
+    camT.s = Math.min(2 / w * (vw / Math.min(vw, vh)) * 0.78, 2 / h * (vh / Math.min(vw, vh)) * 0.72, 5);
+  }
+  const k = reduce ? 1 : 0.07;
+  cam.x += (camT.x - cam.x) * k; cam.y += (camT.y - cam.y) * k; cam.s += (camT.s - cam.s) * k;
+
+  ctx.fillStyle = "#000"; ctx.fillRect(0, 0, vw, vh);
+
+  /* --- 1. faint "other relations" between discovered nodes (context) --- */
+  if (doneN > 1 && D.edges.length < 20000){
+    ctx.lineWidth = 0.6; ctx.strokeStyle = "rgba(140,160,190,0.07)"; ctx.beginPath();
+    for (const e of D.edges){ const a = rank[e[0]], b = rank[e[1]]; if (a >= 0 && b >= 0 && a < doneN && b < doneN){ ctx.moveTo(sx(X[e[0]]), sy(Y[e[0]])); ctx.lineTo(sx(X[e[1]]), sy(Y[e[1]])); } }
+    ctx.stroke();
+  }
+
+  /* --- 2. discovery paths (the tree the crawler actually walked) --- */
+  const recent = Math.max(0, doneN - W * 10);
+  ctx.lineWidth = 0.9;
+  for (let i = 0; i < doneN; i++){
+    const s = S[i]; if (s[1] < 0) continue;
+    const c = s[2] >= 0 ? D.relColors[s[2]] : "#58a6ff";
+    const fresh = i >= recent ? 0.35 + 0.5 * (i - recent) / Math.max(1, doneN - recent) : 0.22;
+    ctx.strokeStyle = rgba(c === "#484f58" || c === "#6e7681" ? "#8aa4ff" : c, fresh);
+    ctx.beginPath(); ctx.moveTo(sx(X[s[1]]), sy(Y[s[1]])); ctx.lineTo(sx(X[s[0]]), sy(Y[s[0]])); ctx.stroke();
+  }
+
+  /* --- 3. every discovered node as a dot --- */
+  for (let i = 0; i < doneN; i++){
+    const n = S[i][0]; const c = D.kindColors[K[n]];
+    ctx.fillStyle = c; ctx.beginPath(); ctx.arc(sx(X[n]), sy(Y[n]), i < 1 ? 4 : 2.4, 0, 6.2832); ctx.fill();
+  }
+
+  /* --- 4. crawlers in flight: glowing head travelling along a link --- */
+  for (let i = doneN; i < startN; i++){
+    const s = S[i], n = s[0], u = ease(t - i / W);
+    const c = D.kindColors[K[n]];
+    const px = s[1] >= 0 ? X[s[1]] : X[n], py = s[1] >= 0 ? Y[s[1]] : Y[n];
+    const hx = sx(px + (X[n] - px) * u), hy = sy(py + (Y[n] - py) * u);
+    ctx.strokeStyle = rgba(c, 0.9); ctx.lineWidth = 1.6;
+    ctx.beginPath(); ctx.moveTo(sx(px), sy(py)); ctx.lineTo(hx, hy); ctx.stroke();
+    ctx.save(); ctx.shadowColor = c; ctx.shadowBlur = 14; ctx.fillStyle = "#fff";
+    ctx.beginPath(); ctx.arc(hx, hy, 3.2, 0, 6.2832); ctx.fill(); ctx.restore();
+    // scan ring on the page the crawler is reading from
+    ctx.strokeStyle = rgba(c, 0.5 * (1 - u)); ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.arc(sx(px), sy(py), 6 + 14 * u, 0, 6.2832); ctx.stroke();
+  }
+
+  /* --- 5. link tags: the reel's highlighted boxes on recent finds --- */
+  ctx.font = "12px " + getComputedStyle(document.body).getPropertyValue("--mono");
+  ctx.textBaseline = "middle";
+  const maxTags = tags ? Math.min(48, 14 + W * 6) : 0;
+  const from = Math.max(0, doneN - maxTags);
+  for (let i = from; i < doneN; i++){
+    const n = S[i][0], c = D.kindColors[K[n]];
+    const age = doneN - 1 - i;                    // 0 = newest
+    const pop = reduce ? 1 : ease((t - (i / W + 1)) * 4);
+    const label = String(D.nodes[n][3]);
+    const tw = Math.min(ctx.measureText(label).width, 220);
+    const x = sx(X[n]) + 8, y = sy(Y[n]);
+    ctx.save(); ctx.translate(x, y); ctx.rotate(TILT[n]); ctx.scale(0.6 + 0.4 * pop, 0.6 + 0.4 * pop);
+    ctx.globalAlpha = Math.max(0.25, 1 - age / maxTags) * pop;
+    roundRect(-3, -9, tw + 10, 18, 3);
+    if (age < W){ ctx.fillStyle = c; ctx.fill(); ctx.fillStyle = "#05070b"; }   // newest: solid neon
+    else { ctx.fillStyle = rgba(c, 0.14); ctx.fill(); ctx.strokeStyle = c; ctx.lineWidth = 1; ctx.stroke(); ctx.fillStyle = c; }
+    ctx.beginPath(); ctx.rect(-3, -9, tw + 10, 18); ctx.clip();
+    ctx.fillText(label, 2, 0.5);
+    ctx.restore();
+  }
+  // small labels for older nodes once you zoom in enough to read them
+  if (cam.s > 2.2 && doneN < 3000){
+    ctx.globalAlpha = 0.55; ctx.font = "10px " + getComputedStyle(document.body).getPropertyValue("--mono");
+    for (let i = 0; i < from; i++){ const n = S[i][0]; const x = sx(X[n]), y = sy(Y[n]);
+      if (x > -50 && x < vw + 50 && y > -20 && y < vh + 20){ ctx.fillStyle = D.kindColors[K[n]]; ctx.fillText(String(D.nodes[n][3]).slice(0, 32), x + 5, y); } }
+    ctx.globalAlpha = 1;
+  }
+
+  /* --- 6. selection highlight --- */
+  if (selected >= 0 && rank[selected] >= 0 && rank[selected] < doneN){
+    const x = sx(X[selected]), y = sy(Y[selected]);
+    ctx.strokeStyle = "#fff"; ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(x, y, 9, 0, 6.2832); ctx.stroke();
+    ctx.strokeStyle = "rgba(255,255,255,.55)"; ctx.beginPath();
+    for (const m of NB[selected]){ if (rank[m] >= 0 && rank[m] < doneN){ ctx.moveTo(x, y); ctx.lineTo(sx(X[m]), sy(Y[m])); } }
+    ctx.stroke();
+  }
+
+  hud(doneN, T);
+}
+
+/* =====================================================================
+   HUD  (throttled to ~8 Hz: DOM writes every frame would be wasteful)
+   ===================================================================== */
+let hudAt = 0, logAt = -1;
+function hud(doneN, T){
+  const now = performance.now(); if (now - hudAt < 120) return; hudAt = now;
+  $("sDone").textContent = doneN + " / " + S.length;
+  $("bar").firstChild.style.width = (S.length ? 100 * doneN / S.length : 0) + "%";
+  // frontier = discovered nodes that still have undiscovered children (= the crawler's queue)
+  let fr = 0, dep = 0, links = 0;
+  for (let i = 0; i < doneN; i++){ if (lastChild[i] >= doneN) fr++; if (S[i][3] > dep) dep = S[i][3]; if (S[i][1] >= 0) links++; }
+  $("sFront").textContent = fr; $("sDepth").textContent = dep; $("sLinks").textContent = links;
+  $("rT").value = T ? Math.round(1000 * t / T) : 0;
+  $("oT").textContent = doneN + " / " + S.length;
+  if (logAt !== doneN){
+    logAt = doneN; const lg = $("log"); lg.textContent = "";
+    for (let i = doneN - 1; i >= Math.max(0, doneN - 6); i--){
+      const s = S[i], n = s[0], d = document.createElement("div"), sw = document.createElement("span");
+      sw.style.background = D.kindColors[K[n]]; d.appendChild(sw);
+      d.appendChild(document.createTextNode((s[2] >= 0 ? D.rels[s[2]] + (s[4] ? " → " : " ← ") : "root · ") + D.nodes[n][3]));
+      lg.appendChild(d);
+    }
+  }
+  $("bPlay").textContent = playing ? "❚❚ Pause" : (t >= T ? "↺ Replay" : "▶ Play");
+}
+
+/* =====================================================================
+   LOOP
+   ===================================================================== */
+let prev = performance.now();
+function loop(now){
+  const dt = Math.min(0.1, (now - prev) / 1000); prev = now;
+  if (playing && S.length){
+    t += dt * speed / W;            // speed is "nodes per second" regardless of W
+    if (t >= totalT()){ t = totalT(); playing = false; }
+  }
+  frame();
+  window.NS_STATE = {t, total: totalT(), steps: S.length, mode, playing};   // used by automated tests
+  requestAnimationFrame(loop);
+}
+
+/* =====================================================================
+   INPUT
+   ===================================================================== */
+function togglePlay(){ if (!playing && t >= totalT()) t = 0; playing = !playing; }
+function setFollow(v){ follow = v; $("bFollow").classList.toggle("on", v); $("bFollow").setAttribute("aria-pressed", v); }
+$("bPlay").onclick = togglePlay;
+$("bRe").onclick = () => { t = 0; playing = true; setFollow(true); };
+$("sMode").onchange = e => { setMode(e.target.value); playing = true; };
+$("rSpeed").oninput = e => { speed = speedFromSlider(+e.target.value); };
+$("rW").oninput = e => { const done = t * W; W = +e.target.value; t = done / W; };   // keep progress when W changes
+$("bFollow").onclick = () => setFollow(!follow);
+$("bTags").onclick = () => { tags = !tags; $("bTags").classList.toggle("on", tags); $("bTags").setAttribute("aria-pressed", tags); };
+$("rT").oninput = e => { t = totalT() * (+e.target.value) / 1000; playing = false; };
+$("infoX").onclick = () => { selected = -1; $("info").style.display = "none"; };
+addEventListener("keydown", e => {
+  if (e.target.tagName === "INPUT" || e.target.tagName === "SELECT") return;
+  if (e.code === "Space"){ e.preventDefault(); togglePlay(); }
+  else if (e.key === "r" || e.key === "R") $("bRe").click();
+  else if (e.key === "f" || e.key === "F") setFollow(!follow);
+  else if (e.key === "t" || e.key === "T") $("bTags").click();
+  else if (e.key === "ArrowRight"){ playing = false; t = Math.min(totalT(), t + 1 / W); }
+  else if (e.key === "ArrowLeft"){ playing = false; t = Math.max(0, t - 1 / W); }
+  else if (e.key === "Escape") $("infoX").click();
+});
+
+// pan (drag) / zoom (wheel, pinch) / pick (click)
+let drag = null, moved = false;
+const pts = new Map();
+cv.addEventListener("pointerdown", e => { cv.setPointerCapture(e.pointerId); pts.set(e.pointerId, [e.clientX, e.clientY]); drag = {x: e.clientX, y: e.clientY}; moved = false; cv.classList.add("drag"); });
+cv.addEventListener("pointermove", e => {
+  if (!pts.has(e.pointerId)) return;
+  const old = pts.get(e.pointerId); pts.set(e.pointerId, [e.clientX, e.clientY]);
+  if (pts.size === 2){                               // pinch zoom
+    const [a, b] = [...pts.values()]; const other = a === pts.get(e.pointerId) ? b : a;
+    const d0 = Math.hypot(old[0] - other[0], old[1] - other[1]), d1 = Math.hypot(e.clientX - other[0], e.clientY - other[1]);
+    if (d0 > 0){ zoomAt((e.clientX + other[0]) / 2, (e.clientY + other[1]) / 2, d1 / d0); } return;
+  }
+  const dx = e.clientX - old[0], dy = e.clientY - old[1];
+  if (Math.abs(e.clientX - drag.x) + Math.abs(e.clientY - drag.y) > 4) moved = true;
+  if (moved){ setFollow(false); const f = cam.s * base(); cam.x -= dx / f; cam.y -= dy / f; camT.x = cam.x; camT.y = cam.y; camT.s = cam.s; }
+});
+function endPtr(e){
+  pts.delete(e.pointerId); cv.classList.remove("drag");
+  if (!moved && e.type === "pointerup") pick(e.clientX, e.clientY);
+}
+cv.addEventListener("pointerup", endPtr); cv.addEventListener("pointercancel", endPtr);
+function zoomAt(px, py, f){
+  setFollow(false);
+  const bx = wx(px), by = wy(py);
+  cam.s = Math.max(0.2, Math.min(60, cam.s * f));
+  cam.x = bx - (px - vw / 2) / (cam.s * base()); cam.y = by - (py - vh / 2) / (cam.s * base());
+  camT.x = cam.x; camT.y = cam.y; camT.s = cam.s;
+}
+cv.addEventListener("wheel", e => { e.preventDefault(); zoomAt(e.clientX, e.clientY, Math.exp(-e.deltaY * 0.0015)); }, {passive: false});
+
+function pick(px, py){
+  const doneN = Math.max(0, Math.min(S.length, Math.floor((t - 1) * W) + 1));
+  let best = -1, bd = 14 * 14;
+  for (let i = 0; i < doneN; i++){ const n = S[i][0]; const dx = sx(X[n]) - px, dy = sy(Y[n]) - py, d = dx*dx + dy*dy; if (d < bd){ bd = d; best = n; } }
+  selected = best;
+  if (best < 0){ $("info").style.display = "none"; return; }
+  const nd = D.nodes[best], st = S[rank[best]];
+  $("iT").textContent = nd[3];
+  const tab = $("iTab"); tab.textContent = "";
+  const rows = [["kind", D.kinds[nd[2]]], ["discovered", "step " + (rank[best] + 1) + " of " + S.length],
+                ["via", st[1] >= 0 ? (st[4] ? D.nodes[st[1]][3] + " —" + D.rels[st[2]] + "→ this"
+                                       : "this —" + D.rels[st[2]] + "→ " + D.nodes[st[1]][3] + " (walked backwards)")
+                                : "root (crawl start)"], ["depth", st[3]]];
+  for (const k in nd[4]) rows.push([k, nd[4][k]]);
+  for (const [a, b] of rows){ const tr = document.createElement("tr"); const c1 = document.createElement("td"), c2 = document.createElement("td");
+    c1.textContent = a; c2.textContent = String(b); tr.appendChild(c1); tr.appendChild(c2); tab.appendChild(tr); }
+  $("info").style.display = "block";
+}
+
+/* ---- go ---- */
+setMode(mode);
+playing = !reduce && N > 0;
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
+"""
+
+
+# ============================================================================
 #  Tkinter GUI
 # ============================================================================
 
@@ -2074,8 +3136,12 @@ class NeuralSchemaGUI:
         ttk.Button(bar, text="Re-layout", command=self._relayout).pack(side="left")
 
         # exports on the right
+        # Crawl Mode: writes the animated crawler page and opens it in the
+        # default browser so the user sees the animation immediately.
+        ttk.Button(bar, text="Crawl ▶", style="Accent.TButton",
+                   command=lambda: self._export("crawl")).pack(side="right")
         ttk.Button(bar, text="Export HTML", command=lambda: self._export("html")
-                   ).pack(side="right")
+                   ).pack(side="right", padx=(0, 6))
         ttk.Button(bar, text="Export PNG", command=lambda: self._export("png")
                    ).pack(side="right", padx=(0, 6))
         ttk.Button(bar, text="Export JSON", command=lambda: self._export("json")
@@ -2349,14 +3415,19 @@ class NeuralSchemaGUI:
             self.messagebox.showinfo("NeuralSchema", "Nothing to export — analyze first.")
             return
         ext = {"json": ".json", "png": ".png", "html": ".html",
-               "report": ".md"}[fmt]
-        default = f"{_safe_name(self.graph.title)}{ext}"
+               "report": ".md", "crawl": ".html"}[fmt]
+        suffix = ".crawl" if fmt == "crawl" else ""
+        default = f"{_safe_name(self.graph.title)}{suffix}{ext}"
         p = self.filedialog.asksaveasfilename(defaultextension=ext,
                                               initialfile=default)
         if not p:
             return
         try:
-            if fmt == "json":
+            if fmt == "crawl":
+                export_crawl(self.graph, p, algo=self.layout_algo.get())
+                import webbrowser
+                webbrowser.open("file://" + os.path.abspath(p))
+            elif fmt == "json":
                 export_json(self.graph, p)
             elif fmt == "png":
                 export_png(self.graph, p, self.layout_algo.get())
@@ -2414,6 +3485,19 @@ def _safe_name(s):
 # ============================================================================
 
 def build_from_args(args):
+    # --url: crawl a website (Crawl Mode).  Checked first because it is the
+    # most specific source; the result is an ordinary SchemaGraph, so every
+    # export below works on it.
+    if getattr(args, "url", None):
+        def prog(done, total, url):
+            print(f"\r  crawled {done}/{total}  {url[:70]:70}", end="", flush=True)
+        crawler = WebCrawler(max_pages=args.max_pages,
+                             same_domain=not args.all_domains,
+                             delay=args.crawl_delay,
+                             strategy=args.strategy if args.strategy != "replay" else "bfs")
+        sg = crawler.crawl(args.url, progress=prog)
+        print()
+        return sg
     if args.system:
         return SystemAnalyzer(top_processes=args.top,
                               include_connections=args.connections).analyze()
@@ -2469,10 +3553,28 @@ def main(argv=None):
                     help="code mode: hide external/undefined call nodes")
     ap.add_argument("--no-sast", action="store_true",
                     help="code mode: disable the dangerous-call (SAST) tagging")
+    # --- Crawl Mode options ---
+    ap.add_argument("--url", "-u",
+                    help="crawl a website starting at this URL (polite: obeys "
+                    "robots.txt, waits between requests)")
+    ap.add_argument("--max-pages", type=int, default=40,
+                    help="url mode: maximum pages to fetch (default 40)")
+    ap.add_argument("--crawl-delay", type=float, default=1.0,
+                    help="url mode: seconds between requests to one host "
+                    "(default 1.0; robots.txt Crawl-delay wins if larger)")
+    ap.add_argument("--all-domains", action="store_true",
+                    help="url mode: also follow links to other hosts")
+    ap.add_argument("--strategy", choices=["bfs", "dfs", "replay"],
+                    default="bfs",
+                    help="crawl order: bfs (wide), dfs (deep) or replay "
+                    "(the real web-crawl order); used by --export crawl")
+    ap.add_argument("--logo", help="SVG watermark for the crawl page "
+                    "(default: logo-mark.svg next to the script / in cwd)")
     ap.add_argument("--export", "-e", nargs="+",
-                    choices=["json", "html", "png", "report"],
+                    choices=["json", "html", "png", "report", "crawl"],
                     default=[], help="export formats to write "
-                    "(report = Markdown static-analysis report)")
+                    "(report = Markdown static-analysis report, "
+                    "crawl = animated crawler page)")
     ap.add_argument("--report", "-r", action="store_true",
                     help="print the static-analysis report to the console")
     ap.add_argument("--out", "-o", default=".",
@@ -2486,7 +3588,7 @@ def main(argv=None):
         pass
 
     graph = None
-    if args.file or args.system:
+    if args.file or args.system or args.url:
         try:
             graph = build_from_args(args)
         except Exception as e:
@@ -2503,9 +3605,13 @@ def main(argv=None):
             os.makedirs(os.path.dirname(os.path.abspath(out)) or ".", exist_ok=True)
             base = out
         for fmt in args.export:
-            path = f"{base}.{'md' if fmt == 'report' else fmt}"
+            ext = {"report": "md", "crawl": "crawl.html"}.get(fmt, fmt)
+            path = f"{base}.{ext}"
             try:
-                if fmt == "json":
+                if fmt == "crawl":
+                    export_crawl(graph, path, strategy=args.strategy,
+                                 logo_path=args.logo)
+                elif fmt == "json":
                     export_json(graph, path)
                 elif fmt == "png":
                     export_png(graph, path)
@@ -2518,7 +3624,7 @@ def main(argv=None):
                 print(f"failed to write {fmt}: {e}", file=sys.stderr)
 
     # schema + report/security summary (whenever a CLI analysis ran)
-    if graph is not None and (args.file or args.system):
+    if graph is not None and (args.file or args.system or args.url):
         meta = graph.to_dict()["meta"]
         print(f"schema: {meta['node_count']} nodes, {meta['edge_count']} edges, "
               f"kinds={meta['counts_by_kind']}")

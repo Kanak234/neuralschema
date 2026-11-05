@@ -2,6 +2,12 @@
 
 Universal Code & System Architecture Analyzer.
 
+![Crawl Mode: a crawler exploring NeuralSchema's own source](docs/crawl-mode.jpg)
+
+> **New in 0.2 — Crawl Mode.** Watch a crawler discover your code, your OS or
+> a website node by node (BFS / DFS / real-crawl replay), as one offline HTML
+> page. See [docs/CRAWL_MODE.md](docs/CRAWL_MODE.md).
+
 Builds a "neural schema" (an architecture graph of nodes + relations) for:
 
 1. **Source code** across many languages
@@ -42,6 +48,25 @@ python3 neural_schema.py --system --top 50
 python3 neural_schema.py --file src/ --export html json png --out ./schema --no-gui
 python3 neural_schema.py --system --connections --export html --no-gui
 ```
+
+### Crawl Mode
+
+```bash
+# Animate a crawler exploring your project (BFS by default, switch to DFS in the page):
+python3 neural_schema.py --file src/ --export crawl --out ./schema/ --no-gui
+
+# Crawl a website politely (robots.txt, 1 s delay, 40-page cap) and replay the real crawl:
+python3 neural_schema.py --url https://example.com/ --max-pages 40 --strategy replay --export crawl json --no-gui
+```
+
+Open the resulting `*.crawl.html` in any browser — no internet or server needed.
+Controls: **Space** play/pause · **R** restart · **F** camera follow · **T** tags ·
+**← →** step · drag to pan · wheel/pinch to zoom · click a node for details.
+In the GUI, press **Crawl ▶** after analyzing.
+
+Only crawl sites you are allowed to crawl. The crawler obeys `robots.txt`
+(including `Crawl-delay`), `rel="nofollow"` and `<meta name="robots" content="nofollow">`,
+sends an honest User-Agent and never crawls off-site hosts unless you pass `--all-domains`.
 
 ## Dependencies
 
